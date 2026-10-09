@@ -1,0 +1,15 @@
+[Unit]
+Description=memd nightly jobs (facts, current-state summaries, health; verify when enabled)
+After=network-online.target
+
+[Service]
+Type=oneshot
+# Store, model and job settings (MEMD_PROFILE, MEMD_LLM_URL, MEMD_NIGHTLY_STEPS, ...)
+# come from the same env file the service uses. Add verify to MEMD_NIGHTLY_STEPS only
+# on a host that can reach the probe targets.
+EnvironmentFile=%h/.config/memd/env
+ExecStart=%h/projects/memd/.venv/bin/mem-nightly --push
+Nice=10
+
+[Install]
+WantedBy=default.target

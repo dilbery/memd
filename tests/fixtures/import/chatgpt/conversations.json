@@ -1,0 +1,18 @@
+[
+  {
+    "title": "Proxy setup",
+    "conversation_id": "conv-aaa",
+    "create_time": 1767225600.5,
+    "current_node": "n4",
+    "mapping": {
+      "root": {"id": "root", "message": null, "parent": null, "children": ["n1"]},
+      "n1": {"id": "n1", "parent": "root", "children": ["n2"], "message": {"author": {"role": "system"}, "content": {"content_type": "text", "parts": ["You are a helpful assistant."]}}},
+      "n2": {"id": "n2", "parent": "n1", "children": ["n3", "n3b"], "message": {"author": {"role": "user"}, "create_time": 1767225601, "content": {"content_type": "text", "parts": ["Where does the reverse proxy run? My token=supersecretvalue99 by the way."]}}},
+      "n3b": {"id": "n3b", "parent": "n2", "children": [], "message": {"author": {"role": "assistant"}, "content": {"content_type": "text", "parts": ["An abandoned branch that must not be sent."]}}},
+      "n3": {"id": "n3", "parent": "n2", "children": ["n4"], "message": {"author": {"role": "tool"}, "content": {"content_type": "execution_output", "text": "tool output"}}},
+      "n4": {"id": "n4", "parent": "n3", "children": [], "message": {"author": {"role": "assistant"}, "create_time": 1767225602, "content": {"content_type": "text", "parts": ["The reverse proxy runs on vmhost; its config is /etc/nginx/site.conf.", {"type": "image"}]}}}
+    }
+  },
+  {"title": "Broken", "id": "conv-bbb", "mapping": "not a mapping"},
+  "garbage"
+]

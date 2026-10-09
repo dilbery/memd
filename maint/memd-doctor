@@ -1,0 +1,471 @@
+#!/usr/bin/env python3
+"""Deterministic daily health checks for the memd memory stack."""
+
+import argparse
+import hashlib
+import json
+import os
+import shutil
+import socket
+import subprocess
+import sys
+import time
+import urllib.request
+import urllib.error
+import datetime
+
+BASE = os.environ.get("MEMD_DOCTOR_BASE", "https://memd.example.com")
+AMBER = os.environ.get("MEMD_DOCTOR_AMBER", "http://10.10.1.10:8077")
+COBALT = os.environ.get("MEMD_DOCTOR_COBALT", "http://10.10.1.10:8078")
+ENV_DIR = os.environ.get("MEMD_DOCTOR_ENV_DIR", os.path.expanduser("~/.config/memd"))
+FORGEJO = os.environ.get("MEMD_DOCTOR_FORGEJO", "http://10.10.1.10:3000")
+FORGEJO_REPO = os.environ.get("MEMD_DOCTOR_FORGEJO_REPO", "svcuser/memd")
+FORGEJO_TOKEN_FILE = os.environ.get(
+    "MEMD_DOCTOR_FORGEJO_TOKEN", os.path.expanduser("~/.config/forgejo/token"))
+REPO = os.environ.get(
+    "MEMD_DOCTOR_REPO", os.path.dirname(os.path.dirname(os.path.realpath(__file__))))
+BRIDGE = os.environ.get("MEMD_DOCTOR_BRIDGE", os.path.expanduser("~/.local/bin/memd-mcp-bridge"))
+TOKEN_ENV_FILE = os.path.join(ENV_DIR, "memd-claude.env")
+# An earlier probe note was superseded, after which every probe save forked a
+# fresh versioned note instead of updating it. Use fresh slugs, one per writer,
+# and C5/C11 fail if a save lands anywhere else.
+PROBE_SLUG = "memd-doctor-probe"
+OMP_PROBE_SLUG = "memd-doctor-probe-omp"
+HTTP_TIMEOUT = 20.0
+OMP_TIMEOUT = 360
+
+STATE: dict = {}
+
+
+def log(msg: str) -> None:
+    """Writes msg + newline to stderr and flushes."""
+    sys.stderr.write(f"{msg}\n")
+    sys.stderr.flush()
+
+
+def read_token(path: str) -> str | None:
+    """Parses a KEY=VALUE env file, returns the MEMD_TOKEN value stripped of quotes or None."""
+    try:
+        with open(path, "r") as f:
+            for line in f:
+                if "=" in line and line.startswith("MEMD_TOKEN="):
+                    val = line.split("=", 1)[1].strip()
+                    if not val:
+                        return None
+                    if (val.startswith("'") and val.endswith("'")) or \
+                       (val.startswith('"') and val.endswith('"')):
+                        val = val[1:-1]
+                    return val
+    except Exception:
+        pass
+    return None
+
+
+def http_json(url: str, payload: dict | None = None, token: str | None = None,
+              timeout: float = HTTP_TIMEOUT) -> tuple[int, dict | None, str]:
+    """GET when payload is None, else POST with JSON body. Returns (status, parsed_json_or_None, raw_text_first_500_chars)."""
+    headers = {"Accept": "application/json, text/event-stream"}
+    if token:
+        headers["Authorization"] = f"Bearer {token}"
+    
+    data = None
+    if payload is not None:
+        headers["Content-Type"] = "application/json"
+        data = json.dumps(payload).encode("utf-8")
+
+    req = urllib.request.Request(url, data=data, headers=headers, method="POST" if data else "GET")
+    
+    try:
+        with urllib.request.urlopen(req, timeout=timeout) as resp:
+            raw_bytes = resp.read()
+            status_code = resp.status
+            full = raw_bytes.decode("utf-8", errors="replace")
+            parsed = None
+            if full.strip():
+                try:
+                    parsed = json.loads(full)
+                except (json.JSONDecodeError, ValueError):
+                    pass
+            return (status_code, parsed, full[:500])
+    except urllib.error.HTTPError as e:
+        raw_bytes = e.read()
+        full = raw_bytes.decode("utf-8", errors="replace")
+        parsed = None
+        if full.strip():
+            try:
+                parsed = json.loads(full)
+            except (json.JSONDecodeError, ValueError):
+                pass
+        return (e.code, parsed, full[:500])
+    except Exception as e:
+        return (-1, None, str(e)[:500])
+
+
+def mcp_call(name: str, arguments: dict, token: str) -> tuple[int, str]:
+    """POST to BASE + "/mcp/" the JSON-RPC message. Returns (status, text)."""
+    payload = {
+        "jsonrpc": "2.0",
+        "id": 1,
+        "method": "tools/call",
+        "params": {"name": name, "arguments": arguments}
+    }
+    status_code, parsed_json, raw_text = http_json(BASE + "/mcp/", payload=payload, token=token)
+
+    if status_code == 200 and parsed_json is not None:
+        result = parsed_json.get("result")
+        content_list = []
+        if isinstance(result, dict):
+            content_list = result.get("content", [])
+        
+        text = raw_text
+        if isinstance(content_list, list) and len(content_list) > 0:
+            first_content = content_list[0]
+            if isinstance(first_content, dict):
+                text = first_content.get("text", raw_text)
+
+        return (200, str(text))
+    
+    return (status_code, raw_text)
+
+
+def check(cid: str, name: str, fn) -> dict:
+    """Runs fn() which returns a (status, detail) tuple. Catches exceptions."""
+    try:
+        status, detail = fn()
+    except Exception as e:
+        status = "FAIL"
+        detail = f"exception: {e!r}"
+
+    log(f"{cid} {status}: {name} — {detail}")
+    return {"id": cid, "name": name, "status": status, "detail": detail}
+
+
+def server_health(host: str) -> tuple[str, str]:
+    """GET {host}/health. FAIL if status != 200 or body is None or ok is not True."""
+    status_code, parsed_json, raw_text = http_json(f"{host}/health")
+    
+    if status_code != 200:
+        return ("FAIL", f"status={status_code}")
+    if not isinstance(parsed_json, dict):
+        return ("FAIL", "no JSON body")
+    if parsed_json.get("ok") is not True:
+        return ("FAIL", "body['ok'] is not True")
+
+    checks = parsed_json.get("checks", {})
+    failed_checks = []
+    
+    if not isinstance(checks, dict):
+        return ("FAIL", "invalid health checks")
+    for key, val in checks.items():
+        if isinstance(val, dict) and not val.get("ok"):
+            failed_checks.append(key)
+    git_check = checks.get("git")
+    if not isinstance(git_check, dict) or git_check.get("in_sync") is not True:
+        failed_checks.append("git.in_sync")
+
+    if failed_checks:
+        return ("FAIL", f"failed sub-checks: {', '.join(failed_checks)}")
+
+    idx_notes = ""
+    index_check = checks.get("index", {})
+    if isinstance(index_check, dict):
+        idx_notes = str(index_check.get("notes", ""))
+
+    status_val = parsed_json.get("status", "")
+    # Without a token /health carries pass/fail only, so the note count may be absent.
+    return ("PASS", f"status={status_val}" + (f" notes={idx_notes}" if idx_notes else ""))
+
+
+def c1() -> tuple[str, str]:
+    """C1: amber instance /health, every sub-check ok."""
+    return server_health(AMBER)
+
+
+def c2() -> tuple[str, str]:
+    """C2: cobalt instance /health, every sub-check ok."""
+    return server_health(COBALT)
+
+
+def c3() -> tuple[str, str]:
+    """C3 — advertised schema is permissive."""
+    token = read_token(TOKEN_ENV_FILE)
+    if not token:
+        return ("FAIL", "no memd token")
+
+    payload = {"jsonrpc": "2.0", "id": 1, "method": "tools/list"}
+    status_code, parsed_json, raw_text = http_json(BASE + "/mcp/", payload=payload, token=token)
+
+    if status_code != 200:
+        return ("FAIL", f"http {status_code}")
+    
+    result = parsed_json.get("result") if isinstance(parsed_json, dict) else None
+    tools_list = []
+    if isinstance(result, dict):
+        tools_list = result.get("tools", [])
+
+    tool_map = {}
+    for t in tools_list:
+        name = t.get("name", "")
+        schema = t.get("inputSchema", {})
+        tool_map[name] = schema
+
+    missing_tools = {"recall", "read", "save"} - tool_map.keys()
+    if missing_tools:
+        return ("FAIL", f"missing tools: {', '.join(sorted(missing_tools))}")
+
+    fail_details = []
+    
+    for tool_name in ["recall", "save"]:
+        schema = tool_map[tool_name]
+        required = schema.get("required", [])
+        if required != []:
+            fail_details.append(f"{tool_name} required={required}")
+
+    save_props = set(tool_map["save"].get("properties", {}).keys())
+    recall_props = set(tool_map["recall"].get("properties", {}).keys())
+
+    expected_save = {"content","text","slug","name","fact","note"}
+    if not expected_save.issubset(save_props):
+        fail_details.append(f"save missing props: {expected_save - save_props}")
+
+    expected_recall = {"q","question","topic","search"}
+    if not expected_recall.issubset(recall_props):
+        fail_details.append(f"recall missing props: {expected_recall - recall_props}")
+
+    if fail_details:
+        return ("FAIL", "; ".join(fail_details))
+
+    return ("PASS", "required=[] on both, aliases advertised")
+
+
+def c4() -> tuple[str, str]:
+    """C4 — recall via alias."""
+    token = read_token(TOKEN_ENV_FILE)
+    if not token:
+        return ("FAIL", "no memd token")
+
+    status_code, text = mcp_call("recall", {"q": "gpuhost lemonade"}, token)
+
+    if status_code != 200 or "Recalled memory" not in text:
+        return ("FAIL", f"http {status_code}")
+    
+    return ("PASS", f"{len(text)} chars")
+
+
+def c5() -> tuple[str, str]:
+    """C5 — save via alias shape."""
+    token = read_token(TOKEN_ENV_FILE)
+    if not token:
+        return ("FAIL", "no memd token")
+
+    nonce_a = f"doctor-{int(time.time())}"
+    payload_args = {
+        "slug": PROBE_SLUG,
+        "content": f"memd daily probe. nonce {nonce_a}",
+        "importance": 1,
+        "tags": "probe"
+    }
+
+    status_code, text = mcp_call("save", payload_args, token)
+
+    if status_code != 200:
+        return ("FAIL", f"http {status_code}")
+
+    parsed = None
+    try:
+        parsed = json.loads(text)
+    except (json.JSONDecodeError, ValueError):
+        pass
+
+    if not isinstance(parsed, dict):
+        return ("FAIL", "invalid JSON response")
+    
+    if ("error" in parsed or parsed.get("saved") is not True
+            or not parsed.get("revision") or parsed.get("lexical_indexed") is not True):
+        return ("FAIL", f"save/keyword visibility not confirmed: {parsed}")
+
+    if parsed.get("slug") != PROBE_SLUG:
+        return ("FAIL", f"probe save forked to {parsed.get('slug')!r} instead of updating {PROBE_SLUG!r}")
+
+    STATE['nonce_a'] = nonce_a
+    return ("PASS", f"action={parsed.get('action')} nonce={nonce_a} "
+            f"indexed={parsed.get('indexed')} synced={parsed.get('synced')}")
+
+
+def c6() -> tuple[str, str]:
+    """C6 — the write round-tripped."""
+    if 'nonce_a' not in STATE:
+        return ("SKIP", "no nonce from C5")
+
+    token = read_token(TOKEN_ENV_FILE)
+    if not token:
+        return ("FAIL", "no memd token")
+
+    nonce_a = STATE['nonce_a']
+    status_code, text = mcp_call("recall", {"query": nonce_a}, token)
+
+    if status_code != 200 or nonce_a not in text:
+        return ("FAIL", f"http {status_code}")
+
+    return ("PASS", "probe note retrieved by nonce")
+def c7():
+    if not os.path.isfile(BRIDGE):
+        return ("SKIP", f"{BRIDGE} not installed")
+    env = dict(os.environ)
+    env["MEMD_ENV_FILE"] = TOKEN_ENV_FILE
+    try:
+        res = subprocess.run(
+            [sys.executable, BRIDGE, "--selftest"],
+            capture_output=True, text=True, timeout=30, env=env
+        )
+        out = (res.stdout + res.stderr)[-200:] if res.returncode != 0 else ""
+        if res.returncode != 0:
+            return ("FAIL", out)
+    except Exception as e:
+        return ("FAIL", str(e))
+    return ("PASS", "selftest ok")
+
+def c8():
+    repo_path = os.path.join(REPO, "clients", "memd-mcp-bridge")
+    if not os.path.isfile(repo_path) or not os.path.isfile(BRIDGE):
+        return ("SKIP", "missing bridge source files")
+    def sha(path):
+        h = hashlib.sha256()
+        with open(path, 'rb') as f:
+            for chunk in iter(lambda: f.read(8192), b''):
+                h.update(chunk)
+        return h.hexdigest()
+    repo_hash = sha(repo_path)
+    inst_hash = sha(BRIDGE)
+    if repo_hash != inst_hash:
+        return ("FAIL", "installed bridge differs from repo clients/memd-mcp-bridge")
+    return ("PASS", repo_hash[:12])
+
+def c9():
+    status, data, _ = http_json(f"{AMBER}/health")
+    app_commit = None if not isinstance(data, dict) else data.get("app_commit")
+    if not app_commit or app_commit == "unknown":
+        return ("FAIL", "server does not report app_commit (image not stamped)")
+    # The forgejo token file is a BARE token, not a KEY=VALUE env file.
+    try:
+        with open(FORGEJO_TOKEN_FILE) as f:
+            tok = f.read().strip()
+    except OSError:
+        tok = ""
+    if not tok:
+        return ("SKIP", "no forgejo token")
+    url = f"{FORGEJO}/api/v1/repos/{FORGEJO_REPO}/branches/main"
+    req = urllib.request.Request(url, headers={"Authorization": f"token {tok}"})
+    try:
+        resp = urllib.request.urlopen(req, timeout=HTTP_TIMEOUT)
+        main_data = json.loads(resp.read().decode())
+    except Exception as e:
+        return ("SKIP", str(e))
+    main_commit = main_data.get("commit", {}).get("id")
+    if not main_commit:
+        return ("SKIP", "forgejo reply had no commit id")
+    app8 = app_commit[:8] if len(app_commit) >= 8 else app_commit
+    main8 = main_commit[:8] if len(main_commit) >= 8 else main_commit
+    if main_commit != app_commit:
+        return ("FAIL", f"deployed {app8} != main {main8}")
+    return ("PASS", f"in sync @ {app8}")
+
+def c10():
+    missing = []
+    for fname in ["memd.env", "memd-claude.env", "memd-codex.env"]:
+        path = os.path.join(ENV_DIR, fname)
+        if not read_token(path):
+            missing.append(fname)
+    if missing:
+        return ("FAIL", "; ".join(missing))
+    return ("PASS", "3 token files ok")
+
+def c11():
+    if shutil.which("omp") is None:
+        return ("SKIP", "omp not installed")
+    nonce_b = f"omp-{int(time.time())}"
+    prompt = (
+        f"Using your memd save tool mounted at xd://mcp__memd_save, save a note with slug '{OMP_PROBE_SLUG}', "
+        f"body 'memd daily probe via omp. nonce {nonce_b}', importance 1, tags ['probe']. Then reply with just: SAVED"
+    )
+    try:
+        res = subprocess.run(
+            ["omp", "-p", prompt], capture_output=True, text=True, timeout=OMP_TIMEOUT, cwd=os.path.expanduser("~")
+        )
+        out = (res.stdout + res.stderr)[-200:] if res.returncode != 0 else ""
+        if res.returncode != 0:
+            return ("FAIL", out)
+    except subprocess.TimeoutExpired:
+        return ("FAIL", "omp timed out")
+    except Exception as e:
+        return ("FAIL", str(e))
+    STATE['nonce_b'] = nonce_b
+    STATE['c11_ok'] = True
+    return ("PASS", "omp run completed")
+
+def c12():
+    if not STATE.get('c11_ok'):
+        return ("SKIP", "C11 did not succeed")
+    token = STATE['token']
+    nonce_b = STATE.get('nonce_b')
+    if not nonce_b:
+        return ("SKIP", "no nonce")
+    status, text = mcp_call("recall", {"query": nonce_b}, token)
+    if status != 200 or nonce_b not in (text or ""):
+        return ("FAIL", "omp reported success but the nonce never reached the server")
+    return ("PASS", "omp-written nonce retrieved")
+
+def main():
+    parser = argparse.ArgumentParser()
+    parser.add_argument('--skip-omp', action='store_true')
+    parser.add_argument('--json-indent', type=int, default=2)
+    args = parser.parse_args()
+
+    token = read_token(TOKEN_ENV_FILE)
+    if not token:
+        ev = {
+            "ts": datetime.datetime.now(datetime.timezone.utc).isoformat(timespec="seconds"),
+            "host": socket.gethostname(),
+            "checks": [{"id": "C0", "name": "memd token file", "status": "FAIL",
+                        "detail": f"no MEMD_TOKEN in {TOKEN_ENV_FILE}"}],
+            "failed": 1, "skipped": 0,
+        }
+        print(json.dumps(ev, indent=args.json_indent))
+        sys.exit(1)
+
+    STATE['token'] = token
+    
+    def skip_omp_fn():
+        return ("SKIP", "--skip-omp")
+
+    plan = [
+        ("C1", "amber /health", c1), ("C2", "cobalt /health", c2),
+        ("C3", "schema permissive", c3), ("C4", "recall alias", c4),
+        ("C5", "save alias probe", c5), ("C6", "probe round-trip", c6),
+        ("C7", "bridge selftest", c7), ("C8", "bridge repo sync", c8),
+        ("C9", "deploy drift", c9), ("C10", "token files", c10),
+    ]
+
+    if args.skip_omp:
+        plan.extend([("C11", "omp e2e", skip_omp_fn), ("C12", "omp save verified", skip_omp_fn)])
+    else:
+        plan.extend([("C11", "omp e2e", c11), ("C12", "omp save verified", c12)])
+
+    results = [check(cid, nm, fn) for cid, nm, fn in plan]
+    
+    failed_count = sum(1 for r in results if r['status'] == 'FAIL')
+    skipped_count = sum(1 for r in results if r['status'] == 'SKIP')
+
+    evidence = {
+        "ts": datetime.datetime.now(datetime.timezone.utc).isoformat(timespec="seconds"),
+        "host": socket.gethostname(),
+        "checks": results,
+        "failed": failed_count,
+        "skipped": skipped_count
+    }
+    
+    print(json.dumps(evidence, indent=args.json_indent))
+    sys.exit(0 if failed_count == 0 else 1)
+
+if __name__ == "__main__":
+    main()

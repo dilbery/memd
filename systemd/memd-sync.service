@@ -1,0 +1,18 @@
+[Unit]
+Description=memd index sync — pull the amber memory clone, reindex changed notes
+After=network-online.target memd.service
+Wants=network-online.target
+
+[Service]
+Type=oneshot
+User=svcuser
+Group=svcuser
+Environment=HOME=/home/svcuser
+Environment=MEMD_PROFILE=amber
+# Pull the shared store into memd's OWN clone, then re-embed only notes whose
+# git blob changed (cheap when idle; the recall stale-HEAD check covers the gap
+# between syncs). Never fails the unit on a transient pull/embedding-backend hiccup.
+ExecStart=/bin/sh -c 'git -C /home/svcuser/.memd/amber/clone pull --rebase --autostash -q 2>/dev/null; /home/svcuser/projects/memd/.venv/bin/mem reindex || true'
+
+[Install]
+WantedBy=multi-user.target

@@ -1,0 +1,19 @@
+services:
+  memd:
+    build: .
+    restart: unless-stopped
+    ports:
+      - "127.0.0.1:8077:8077"
+    environment:
+      MEMD_ADMIN_DB: /data/control/admin.db
+      MEMD_PROFILE: personal
+      MEMD_VAULT_ROOTS: /vaults
+      # Optional: configure compatible model endpoints here or per store in Settings.
+      # MEMD_EMBED_URL: http://embedding-service:8080
+      # MEMD_RERANK_URL: http://reranker:8000
+    volumes:
+      - memory-data:/data
+      # Mount a local vault for Obsidian integration, with UID 1000 read/write access:
+      # - /absolute/path/to/your/vault:/vaults/personal
+volumes:
+  memory-data:

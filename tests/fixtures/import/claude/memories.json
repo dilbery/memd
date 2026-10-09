@@ -1,0 +1,6 @@
+[
+  {
+    "conversations_memory": "## Work context\nMaintains a small self-hosted memory service written in Python.\n\n## Preferences\nLikes short commit messages and hermetic tests.",
+    "project_memories": {"p-0001": "The homelab project tracks vmhost and lapbox."}
+  }
+]

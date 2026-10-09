@@ -1,0 +1,71 @@
+[build-system]
+requires = ["setuptools>=77"]  # PEP 639 SPDX license field
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "memd"
+version = "0.1.0"
+description = "memd — git-markdown memory store acceleration and write hygiene"
+requires-python = ">=3.13,<3.14"
+license = "LicenseRef-PolyForm-Noncommercial-1.0.0-with-Internal-Use"  # see LICENSE
+license-files = ["LICENSE", "LICENSING.md"]
+dependencies = [
+    "PyYAML>=6.0",
+    "httpx>=0.27",
+    "fastapi>=0.115",
+    "uvicorn>=0.30",
+    "sqlite-vec>=0.1.6",
+    "gitpython>=3.1",
+    "mcp>=2.2,<3",   # memd/mcp.py uses the 2.x lowlevel Server (on_* handlers, snake_case types)
+    "jsonschema>=4.20",   # memd/mcp.py validates tool arguments itself; 2.x stopped doing it
+    # OIDC resource server and browser consoles. RS256 verification against the
+    # provider's JWKS needs a real JWS implementation; memd must never hand-roll one.
+    "PyJWT[crypto]>=2.9",
+    # Encrypted personal stores (memd.crypt): AES-256-GCM and HKDF. Already pulled
+    # in by PyJWT[crypto]; named because memd uses it directly.
+    "cryptography>=43",
+    "Authlib>=1.7.0",
+    "Jinja2>=3.1.6",
+]
+
+[project.urls]
+Homepage = "https://github.com/dilbery/memd"
+Source = "https://github.com/dilbery/memd"
+Issues = "https://github.com/dilbery/memd/issues"
+
+[project.optional-dependencies]
+dev = [
+    "pytest>=8.0",
+    "respx>=0.21",
+    "httpx>=0.27",
+    "pytest-httpx",
+]
+
+[project.scripts]
+mem = "memd.cli:main"
+mem-mcp = "memd.mcp:main"
+mem-carve = "memd.cli_carve:main"
+mem-budget-lint = "memd.budget_lint:main"
+mem-sweep = "memd.cli_sweep:main"
+mem-summarize = "memd.summarize:main"
+mem-facts = "memd.facts:main"
+mem-verify = "memd.verify:main"
+mem-forget = "memd.forget:main"
+mem-usage = "memd.usage:main"
+mem-inbox = "memd.inbox:main"
+mem-import = "memd.importers:main"
+mem-health = "memd.insights:main"
+mem-crypt = "memd.cli_crypt:main"
+mem-share = "memd.share:main"
+mem-nightly = "memd.nightly:main"
+mem-backup = "memd.backup:main"
+memd-control = "memd.control_cli:main"
+
+[tool.setuptools.packages.find]
+include = ["memd*"]
+
+[tool.setuptools.package-data]
+memd = ["web/*.html", "web/*.css", "web/*.js", "web/*.svg", "web_assets/*", "web_templates/*"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]

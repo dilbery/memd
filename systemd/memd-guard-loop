@@ -1,0 +1,47 @@
+#!/usr/bin/env bash
+# memd-guard-loop — health watcher for the memd service. Probes memd's OWN
+# /health every 15s. memd-down -> restart memd.service
+# + Pushover on recovery. It treats UPSTREAM degradation (reranker / embed
+# backend returning 5xx or refusing connections, e.g. during a model-server
+# GPU-reset recovery) as a DEGRADE signal only — memd is designed to serve from the
+# remaining path, so the guard NEVER restarts memd for an upstream outage.
+set -uo pipefail
+
+MEMD_URL="${MEMD_URL:-http://127.0.0.1:8077}"
+INTERVAL="${MEMD_GUARD_INTERVAL:-15}"
+FAIL_THRESHOLD="${MEMD_GUARD_FAILS:-3}"
+
+down_count=0
+was_down=0
+
+while true; do
+  # memd's own health. --max-time bounds the probe; refused/timeouts -> non-200.
+  code="$(curl -s -o /dev/null -w '%{http_code}' --max-time 5 "${MEMD_URL}/health" 2>/dev/null || echo 000)"
+
+  if [ "$code" = "200" ]; then
+    if [ "$was_down" = "1" ]; then
+      /usr/local/bin/pushover -t "memd recovered" "memd /health is 200 again after restart" || true
+      was_down=0
+    fi
+    down_count=0
+  else
+    # Distinguish a memd crash from mere UPSTREAM DEGRADE. If memd answers /health
+    # at all (any HTTP code != 000), memd itself is alive and merely DEGRADEd by a
+    # downstream embed/reranker outage -> do NOT restart.
+    if [ "$code" != "000" ]; then
+      logger -t memd-guard "memd alive but DEGRADE (health=$code; upstream embed/reranker likely down) — not restarting"
+      down_count=0
+    else
+      down_count=$((down_count + 1))
+      logger -t memd-guard "memd unreachable (connection refused/timeout), strike ${down_count}/${FAIL_THRESHOLD}"
+      if [ "$down_count" -ge "$FAIL_THRESHOLD" ]; then
+        was_down=1
+        logger -t memd-guard "restarting memd.service after ${down_count} failed probes"
+        systemctl restart memd.service || true
+        down_count=0
+      fi
+    fi
+  fi
+
+  sleep "$INTERVAL"
+done

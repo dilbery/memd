@@ -1,0 +1,20 @@
+[Unit]
+Description=memd reflect — nightly PROPOSE-ONLY tidy (dedup/staleness -> Forgejo PR + Pushover)
+After=network-online.target
+
+[Service]
+Type=oneshot
+Environment=HOME=/home/svcuser
+Environment=MEMD_CLONE=/home/svcuser/.memd/amber/clone
+Environment=MEMD_PROFILE=amber
+Environment=MEMD_REPO_PATH=svcuser/amber-memory
+Environment=FORGEJO_API=http://10.10.1.10:3000/api/v1
+# FORGEJO_TOKEN is secret — provide it via a drop-in, NOT this repo-committed unit:
+#   sudo -n install -d -m 700 -o svcuser -g svcuser /home/svcuser/.config/systemd/user/memd-reflect.service.d
+#   printf '[Service]\nEnvironment=FORGEJO_TOKEN=%s\n' "$(cat /home/svcuser/.config/memd/forgejo_token)" \
+#     > /home/svcuser/.config/systemd/user/memd-reflect.service.d/token.conf
+#   chmod 600 /home/svcuser/.config/systemd/user/memd-reflect.service.d/token.conf
+ExecStart=/home/svcuser/projects/memd/.venv/bin/python -m memd.reflect
+
+[Install]
+WantedBy=default.target

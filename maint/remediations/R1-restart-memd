@@ -1,0 +1,7 @@
+#!/bin/sh
+# R1 — restart both memd containers on apphost.
+# For: a wedged/unhealthy container (C1/C2 failing) with no deploy drift.
+set -eu
+ssh -o BatchMode=yes -o ConnectTimeout=15 "${MEMD_DEPLOY_SSH:-svcuser@10.10.1.10}" \
+    "cd ~/docker/memd && docker compose up -d --force-recreate memd ${MEMD_SECOND_SERVICE:-memd-cobalt}"
+echo "R1: restarted memd + ${MEMD_SECOND_SERVICE:-memd-cobalt}"

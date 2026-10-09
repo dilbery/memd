@@ -1,0 +1,275 @@
+#!/usr/bin/env python3
+"""Daily maintenance runner for the memd stack."""
+
+import argparse
+import datetime
+import json
+import os
+import subprocess
+import sys
+import tempfile
+
+HERE = os.path.dirname(os.path.abspath(__file__))
+DOCTOR = os.path.join(HERE, "memd-doctor")
+REMEDY_DIR = os.path.join(HERE, "remediations")
+STATE_DIR = os.environ.get("MEMD_MAINT_STATE", os.path.expanduser("~/.local/state/memd-maint"))
+# A command run as `<cmd> <prompt-file> --out <answer-file>` that asks a model
+# to pick one remedy; it must print nothing else to the answer file.
+MODEL_CMD = os.environ.get("MEMD_MAINT_MODEL_CMD", "memd-triage-model")
+PUSHOVER = os.environ.get("MEMD_MAINT_PUSHOVER", os.path.expanduser("~/.local/bin/pushover"))
+MAX_ROUNDS = 2
+DOCTOR_TIMEOUT = 900
+MODEL_TIMEOUT = 900
+REMEDY_TIMEOUT = 600
+MENU = {
+    "R1": ("R1-restart-memd", "restart both memd containers on apphost (wedged/unhealthy container, C1/C2 failing, no drift)"),
+    "R2": ("R2-redeploy-from-git", "full redeploy from Forgejo main (deploy drift C9, stale image, or server-side code fault)"),
+    "R3": ("R3-resync-bridge", "reinstall the MCP bridge from the repo clone (bridge drift C8 or broken bridge C7)"),
+    "R4": ("R4-restart-embed", "restart the embedding container (embed sub-check failing inside C1/C2)"),
+    "R5": ("R5-retry", "no action; re-check (evidence reads as a transient network blip)"),
+}
+
+def log(msg: str) -> None:
+    sys.stderr.write(msg + "\n")
+    sys.stderr.flush()
+
+def run_doctor(skip_omp: bool) -> tuple[int, dict | None, str]:
+    try:
+        args = [sys.executable, DOCTOR]
+        if skip_omp:
+            args.append("--skip-omp")
+        res = subprocess.run(args, capture_output=True, timeout=DOCTOR_TIMEOUT)
+        stderr_str = res.stderr.decode("utf-8", errors="replace")[-2000:]
+        evidence = None
+        try:
+            if res.stdout.strip():
+                evidence = json.loads(res.stdout)
+        except (json.JSONDecodeError, ValueError):
+            pass
+        return (res.returncode, evidence, stderr_str)
+    except subprocess.TimeoutExpired:
+        return (124, None, "doctor timed out")
+
+def triage_prompt(evidence: dict, tried: list[str]) -> str:
+    tried_line = ""
+    if tried:
+        tried_line = "Already tried this run (do NOT choose again): " + ", ".join(tried)
+    menu_lines = "\n".join(f"{k}: {v[1]}" for k, v in MENU.items())
+    return f"""You are the maintenance triage for the memd memory stack. Below is the
+evidence JSON from the deterministic checker. Choose the ONE remediation from
+the menu that best fits the failing checks, or ESCALATE if none clearly
+applies. {tried_line}
+
+MENU:
+{menu_lines}
+ESCALATE: none of the above clearly fixes the evidence; a human must look.
+
+EVIDENCE:
+{json.dumps(evidence, indent=2)}
+
+Reply with ONLY a JSON object, no other text, exactly:
+{{"choice": "<R1|R2|R3|R4|R5|ESCALATE>", "reason": "<one sentence>"}}"""
+
+def ask_model(evidence: dict, tried: list[str]) -> tuple[str, str]:
+    prompt_text = triage_prompt(evidence, tried)
+    tf_p = tempfile.NamedTemporaryFile(mode="w", suffix=".md", delete=False)
+    tf_p.write(prompt_text)
+    tf_p.close()
+    tf_o = tempfile.NamedTemporaryFile(mode="w", suffix=".md", delete=False)
+    out_path = tf_o.name
+    tf_o.close()
+
+    try:
+        try:
+            res = subprocess.run(
+                [MODEL_CMD, tf_p.name, "--out", out_path],
+                capture_output=True, timeout=MODEL_TIMEOUT,
+            )
+        except subprocess.TimeoutExpired:
+            return ("ESCALATE", "triage unavailable: model runner timed out")
+        except Exception as e:
+            return ("ESCALATE", f"triage unavailable: {str(e)[:200]}")
+        if res.returncode != 0:
+            err = res.stderr.decode("utf-8", errors="replace")[-200:]
+            return ("ESCALATE", f"triage unavailable: model runner rc={res.returncode}: {err}")
+
+        try:
+            with open(out_path, "r") as f:
+                text = f.read()
+        except Exception:
+            return ("ESCALATE", "malformed triage reply: could not read output")
+
+        start_idx = text.find("{")
+        end_idx = text.rfind("}")
+        if start_idx == -1 or end_idx == -1:
+            return ("ESCALATE", f"malformed triage reply: {text[:120]}")
+        try:
+            data = json.loads(text[start_idx:end_idx + 1])
+        except (json.JSONDecodeError, ValueError):
+            return ("ESCALATE", f"malformed triage reply: {text[start_idx:start_idx + 120]}")
+
+        choice = str(data.get("choice", ""))
+        reason = str(data.get("reason", ""))[:300]
+        if choice not in MENU and choice != "ESCALATE":
+            return ("ESCALATE", f"model chose unknown action {choice}")
+        return (choice, reason)
+    finally:
+        for path in (tf_p.name, out_path):
+            try:
+                os.unlink(path)
+            except OSError:
+                pass
+
+def apply_remedy(choice: str, dry_run: bool) -> tuple[bool, str]:
+    script_name = MENU.get(choice, ("", ""))[0]
+    path = os.path.join(REMEDY_DIR, script_name)
+    if not os.path.exists(path):
+        return (False, f"script missing {path}")
+    
+    if dry_run:
+        log(f"dry-run: skipped {choice} ({script_name})")
+        return (True, "dry-run: skipped " + script_name)
+
+    try:
+        res = subprocess.run(["/bin/sh", path], capture_output=True, timeout=REMEDY_TIMEOUT)
+        combined = (res.stdout.decode("utf-8", errors="replace") + 
+                    res.stderr.decode("utf-8", errors="replace"))[-500:]
+        return (res.returncode == 0, combined)
+    except subprocess.TimeoutExpired:
+        return (False, "remediation timed out")
+
+def notify(title: str, message: str, dry_run: bool) -> None:
+    if dry_run:
+        log(f"[dry-run] pushover: {title}: {message}")
+        return
+    try:
+        res = subprocess.run(
+            [PUSHOVER, "-t", title, "-p", "1", message],
+            capture_output=True, timeout=30,
+        )
+        if res.returncode != 0:
+            log("pushover failed: " + res.stderr.decode("utf-8", errors="replace")[-200:])
+    except Exception as e:
+        log(f"pushover failed: {str(e)}")
+
+def write_report(evidence: dict | None, transcript: list[str]) -> str:
+    os.makedirs(STATE_DIR, exist_ok=True)
+    now = datetime.datetime.now()
+    fname = f"report-{now.strftime('%Y%m%d-%H%M')}.md"
+    path = os.path.join(STATE_DIR, fname)
+    
+    lines = [f"# memd-maint report {now.isoformat()}", "", "## Transcript"]
+    for line in transcript:
+        lines.append(f"- {line}")
+    
+    ev_str = json.dumps(evidence, indent=2) if evidence else "doctor produced no evidence"
+    lines.extend(["", "## Final evidence", "", f"```json\n{ev_str}\n```\n"])
+    
+    content = "\n".join(lines)
+    with open(path, 'w') as f:
+        f.write(content)
+        
+    latest_path = os.path.join(STATE_DIR, "latest-report.md")
+    with open(latest_path, 'w') as f:
+        f.write(content)
+        
+    return path
+
+def read_state() -> dict:
+    try:
+        p = os.path.join(STATE_DIR, "state.json")
+        if not os.path.exists(p):
+            return {}
+        with open(p, 'r') as f:
+            return json.load(f)
+    except Exception:
+        return {}
+
+def write_state(state: dict) -> None:
+    try:
+        os.makedirs(STATE_DIR, exist_ok=True)
+        p = os.path.join(STATE_DIR, "state.json")
+        with open(p, 'w') as f:
+            json.dump(state, f)
+    except Exception:
+        pass
+
+def main() -> int:
+    parser = argparse.ArgumentParser(description="memd-maint runner")
+    parser.add_argument("--dry-run", action="store_true")
+    parser.add_argument("--skip-omp", action="store_true")
+    args = parser.parse_args()
+
+    transcript = []
+
+    def append_log(msg):
+        log(msg)
+        transcript.append(msg)
+
+    rc, evidence, err = run_doctor(args.skip_omp)
+    failed_str = evidence.get('failed') if evidence else '?'
+    append_log(f"doctor: rc={rc} failed={failed_str}")
+
+    now_iso = datetime.datetime.now().isoformat()
+
+    if rc == 0 and evidence is not None:
+        state = read_state()
+        if state.get("last") == "escalated":
+            notify("memd-maint: recovered", "all checks green again", args.dry_run)
+        write_state({"last": "ok", "ts": now_iso})
+        log("all green")
+        return 0
+
+    if evidence is None:
+        evidence = {"checks": [], "failed": -1, "note": f"doctor rc={rc}, unparseable output", "stderr": err}
+
+    tried: list[str] = []
+
+    for _ in range(MAX_ROUNDS):
+        choice, reason = ask_model(evidence, tried)
+        append_log(f"triage: {choice} — {reason}")
+
+        if choice == "ESCALATE":
+            break
+        
+        if choice in tried:
+            append_log("model repeated a tried remediation; escalating")
+            break
+
+        ok, out = apply_remedy(choice, args.dry_run)
+        tried.append(choice)
+        status_str = 'ok' if ok else 'FAILED'
+        append_log(f"{choice}: {status_str} — {out}")
+
+        rc2, evidence2, err2 = run_doctor(args.skip_omp)
+        failed_str2 = evidence2.get('failed') if evidence2 else '?'
+        append_log(f"recheck: rc={rc2} failed={failed_str2}")
+
+        if rc2 == 0 and evidence2 is not None:
+            notify(f"memd-maint: self-healed via {choice}", f"{reason} — re-check green", args.dry_run)
+            write_state({"last": "ok", "ts": now_iso})
+            write_report(evidence2, transcript)
+            return 0
+        
+        if evidence2 is not None:
+            evidence = evidence2
+
+    path = write_report(evidence, transcript)
+    
+    failing_checks = []
+    checks_list = evidence.get("checks", []) if isinstance(evidence, dict) else []
+    for c in checks_list:
+        cid = c.get('id', 'unknown')
+        status = c.get('status', '')
+        if status == "FAIL":
+            failing_checks.append(cid)
+    
+    failing_str = ", ".join(failing_checks) if failing_checks else "unknown"
+    last_reason = reason if tried and choice != "ESCALATE" else evidence.get("note", "")
+    
+    notify("memd-maint: BORKED", f"failing: {failing_str}. {last_reason}. Report: {path}", args.dry_run)
+    write_state({"last": "escalated", "ts": now_iso})
+    return 1
+
+if __name__ == "__main__":
+    sys.exit(main())

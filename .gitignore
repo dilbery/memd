@@ -1,0 +1,15 @@
+.venv/
+__pycache__/
+*.pyc
+.pytest_cache/
+*.egg-info/
+
+# setuptools build output
+build/
+
+# Private recall-eval labels and baselines (they describe a real corpus)
+eval/golden-*.jsonl
+eval/baseline-*.json
+
+# Claude Code agent worktrees
+.claude/worktrees/

@@ -1,0 +1,8 @@
+{"memories": [
+  {"id": "mem-001", "content": "Prefers tabs over spaces in Go projects and gofmt on save.", "created_at": "2026-03-04T10:00:00Z"},
+  {"id": "mem-002", "content": "The media server lapbox exports /srv/media over NFS v4 to the LAN.", "updated_at": 1767225600},
+  {"id": "mem-003", "content": "Deploy key for the build box: api_key=placeholderplaceholder"},
+  {"id": "mem-004", "content": ""},
+  42,
+  "Uses zsh as the login shell on every workstation."
+]}

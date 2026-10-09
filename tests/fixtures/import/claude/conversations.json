@@ -1,0 +1,13 @@
+[
+  {
+    "uuid": "c-0001",
+    "name": "Backup planning",
+    "created_at": "2026-02-01T09:00:00Z",
+    "chat_messages": [
+      {"uuid": "m1", "sender": "human", "text": "We moved nightly backups to 02:30. password: hunter2hunter2", "content": []},
+      {"uuid": "m2", "sender": "assistant", "text": "", "content": [{"type": "text", "text": "Noted: nightly backups of lapbox now start at 02:30."}, {"type": "tool_use", "name": "x"}]}
+    ]
+  },
+  {"uuid": "c-0002", "name": "Empty", "chat_messages": []},
+  7
+]

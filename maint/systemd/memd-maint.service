@@ -1,0 +1,16 @@
+# Daily memd maintenance: deterministic checks -> local-model triage from a
+# fixed remediation menu -> Pushover escalation with a report file.
+# Design: docs/2026-08-21-memd-maint-design.md
+[Unit]
+Description=memd daily maintenance (doctor + bounded self-heal)
+Wants=network-online.target
+After=network-online.target
+
+[Service]
+Type=oneshot
+ExecStart=%h/projects/memd/maint/memd-triage
+# The doctor and remediations need the user toolchain (the local-model CLI, omp, pushover)
+# and an SSH agent for the apphost remediations (set SSH_AUTH_SOCK in a drop-in).
+Environment=PATH=%h/.local/bin:/usr/local/bin:/usr/bin:/bin
+# The omp e2e leg can legitimately take minutes on a cold model.
+TimeoutStartSec=45min

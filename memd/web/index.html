@@ -1,0 +1,126 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <meta name="color-scheme" content="light dark">
+  <title>memd · Memory index</title>
+  <link rel="icon" href="/ui/assets/icon.svg" type="image/svg+xml">
+  <link rel="stylesheet" href="/ui/assets/style.css">
+  <script src="/ui/assets/app.js" defer></script>
+  <script src="/ui/assets/admin.js" defer></script>
+  <script src="/ui/assets/health.js" defer></script>
+  <script src="/ui/assets/entities.js" defer></script>
+</head>
+<body>
+  <a class="skip" href="#main">Skip to content</a>
+  <header class="masthead">
+    <a class="brand" href="#memory"><img src="/ui/assets/icon.svg" alt="" width="36" height="36"><span>memd<small>Memory for your agents</small></span></a>
+    <div class="header-actions"><label class="sr-only" for="store-select">Memory store</label><select id="store-select" hidden></select><span class="profile" id="profile">Connecting…</span><button id="login-open" class="secondary" hidden>Sign in</button><button id="logout" class="quiet" hidden>Sign out</button><button id="lock" class="quiet" hidden>Lock notes</button></div>
+  </header>
+  <nav class="tabs" aria-label="Main navigation">
+    <a href="#memory" id="tab-memory" aria-current="page">Memory index</a>
+    <a href="#health" id="tab-health">Memory health</a>
+    <a href="#entities" id="tab-entities">Entities</a>
+    <a href="#onboarding" id="tab-onboarding">Onboarding</a>
+    <a href="#settings" id="tab-settings" hidden>Settings</a>
+    <a href="#admin" id="tab-admin" hidden>Administration</a>
+  </nav>
+  <main id="main">
+    <div id="session-notice" class="notice" role="status" hidden></div>
+    <section id="memory-panel" aria-labelledby="memory-title">
+      <div class="page-heading"><div><p class="eyebrow">YOUR KNOWLEDGE, IN ONE PLACE</p><h1 id="memory-title">Memory index</h1><p class="muted">Check the index, find a memory, pick up where you left off.</p></div><button id="refresh" class="secondary">Refresh status</button></div>
+      <div id="status-error" class="notice error" role="alert" hidden></div>
+      <section class="health-strip" aria-label="Service health"><div><span id="health-badge" class="badge">Checking service</span><span id="health-summary">Connecting to memd…</span></div><span id="updated" class="muted small">Updates every 30 seconds</span></section>
+      <div class="metrics" aria-label="Index statistics">
+        <article class="metric primary"><span class="metric-label">Active memories</span><strong id="notes">—</strong><span id="notes-detail" class="muted small">Notes available to recall</span></article>
+        <article class="metric"><span class="metric-label">Semantic index</span><strong id="vectors">—</strong><span id="vector-detail" class="muted small">Vector embeddings</span></article>
+        <article class="metric"><span class="metric-label">Keyword index</span><strong id="keywords">—</strong><span class="muted small">Searchable text records</span></article>
+        <article class="metric"><span class="metric-label">High priority</span><strong id="priority">—</strong><span class="muted small">Importance 4 and 5</span></article>
+      </div>
+      <details class="index-details"><summary>Index details <span id="index-size" class="muted small"></span></summary><div class="detail-grid"><section><h3>Service checks</h3><div id="checks"></div><p class="small muted" id="revision"></p></section><section><h3>By host</h3><div id="hosts" class="breakdown"></div></section><section><h3>By importance</h3><div id="importance" class="breakdown"></div></section></div></details>
+      <section class="library" aria-labelledby="library-title">
+        <div class="section-heading"><div><h2 id="library-title">Explore your memories</h2><p class="muted small">Browse the index or search by meaning and keywords.</p></div><span id="result-count" class="muted small" aria-live="polite"></span></div>
+        <form id="unlock-form" class="unlock"><div><h3>Unlock your notes</h3><p class="small muted">Use a memd access token to browse and search. It stays in this tab’s memory and is cleared when you reload or lock.</p></div><label class="sr-only" for="token">memd access token</label><input id="token" type="password" placeholder="memd access token" autocomplete="off" required><button id="unlock-btn" type="submit">Unlock</button></form>
+        <div id="auth-error" class="notice error" role="alert" hidden></div>
+        <form id="search-form" class="search"><label class="sr-only" for="query">Search memories</label><input id="query" type="search" placeholder="Try “Home Assistant dashboard” or “backup strategy”…" maxlength="2000" disabled><button id="search-btn" type="submit" disabled>Search memories</button><button id="browse" type="button" class="secondary" disabled>Browse all</button></form>
+        <div id="search-error" class="notice error" role="alert" hidden></div>
+        <div id="results" class="results" aria-busy="false"><div class="empty"><span class="empty-symbol" aria-hidden="true">⌕</span><h3>A little context goes a long way.</h3><p>Unlock your notes to explore what your agents remember.</p><a href="#onboarding">Connecting a new machine? Start here →</a></div></div>
+        <div class="pagination" id="pagination" hidden><button id="previous" class="secondary">← Previous</button><span id="page-label" class="muted small" aria-live="polite"></span><button id="next" class="secondary">Next →</button></div>
+      </section>
+    </section>
+    <section id="health-panel" aria-labelledby="health-title" hidden>
+      <div class="page-heading"><div><p class="eyebrow">KEEP MEMORY TRUE AND USEFUL</p><h1 id="health-title">Memory health</h1><p class="muted">Where memory is going stale, contradicting itself or going unused.</p></div><button id="health-refresh" class="secondary">Recompute</button></div>
+      <div id="health-error" class="notice error" role="alert" hidden></div>
+      <div id="health-locked" class="empty"><span class="empty-symbol" aria-hidden="true">◌</span><h3>Your notes are locked</h3><p>Unlock with an access token on the Memory index tab, or sign in, to see this store’s health.</p><a href="#memory">Open memory index →</a></div>
+      <div id="health-content" aria-busy="false" hidden>
+        <p id="health-meta" class="small muted" aria-live="polite"></p>
+        <div id="health-tiles" class="metrics health-tiles" aria-label="Memory health summary"></div>
+        <section class="panel heat-panel" aria-labelledby="heat-title"><div class="section-heading"><div><h2 id="heat-title">Age and staleness</h2><p id="heat-caption" class="small muted">Live notes by the age of their as-of date. Stronger colour means more notes; the last column counts notes past their freshness window.</p></div><label class="heat-group small muted">Group by <select id="heat-group"><option value="tags">Tag</option><option value="hosts">Host</option></select></label></div><div id="heat-body" class="table-scroll"></div><p id="heat-more" class="small muted"></p></section>
+        <div id="health-lists" class="health-lists"></div>
+      </div>
+    </section>
+    <section id="entities-panel" aria-labelledby="entities-title" hidden>
+      <div class="page-heading"><div><p class="eyebrow">EVERYTHING ABOUT ONE THING</p><h1 id="entities-title">Entities</h1><p class="muted">Hosts, services and tags your memory knows about, with their current facts, history and notes.</p></div><button id="entities-refresh" class="secondary">Recompute</button></div>
+      <div id="entities-error" class="notice error" role="alert" hidden></div>
+      <div id="entities-locked" class="empty"><span class="empty-symbol" aria-hidden="true">◌</span><h3>Your notes are locked</h3><p>Unlock with an access token on the Memory index tab, or sign in, to see this store’s entities.</p><a href="#memory">Open memory index →</a></div>
+      <div id="entities-list-view" hidden>
+        <form id="entities-filter" class="entity-filter" role="search"><label class="sr-only" for="entities-query">Filter entities by name</label><input id="entities-query" type="search" placeholder="Filter by name, e.g. “proxy” or “backup”" maxlength="160" autocomplete="off" spellcheck="false"><label class="sr-only" for="entities-kind">Kind of entity</label><select id="entities-kind"><option value="">All kinds</option><option value="host">Hosts</option><option value="service">Services</option><option value="tag">Tags</option></select></form>
+        <p id="entities-meta" class="small muted" aria-live="polite"></p>
+        <ul id="entities-list" class="entity-list" aria-busy="false"></ul>
+      </div>
+      <article id="entity-view" aria-labelledby="entity-title" aria-busy="false" hidden>
+        <a href="#entities" class="back-link">← All entities</a>
+        <div class="entity-head"><h2 id="entity-title" tabindex="-1">Loading…</h2><span id="entity-kind" class="chip"></span></div>
+        <p id="entity-meta" class="small muted"></p>
+        <div id="entity-tiles" class="metrics health-tiles" aria-label="Entity summary"></div>
+        <div id="entity-sections" class="health-lists"></div>
+      </article>
+    </section>
+    <section id="onboarding-panel" aria-labelledby="onboarding-title" hidden>
+      <div class="page-heading"><div><p class="eyebrow">BRING YOUR CONTEXT WITH YOU</p><h1 id="onboarding-title">Connect an agent</h1><p class="muted">One memory service. The same context on every machine.</p></div><span class="badge">Quick start</span></div>
+      <div class="onboarding-grid"><div class="steps">
+        <article class="step"><span class="step-number">01</span><div><h2>Get an access token</h2><p>Ask your server administrator for a token, or use Administration → Access tokens → Issue token. Choose the owner, memory store and permissions, with a separate token for each machine.</p><label for="machine">Machine label</label><input id="machine" value="my-laptop" maxlength="64" pattern="[A-Za-z0-9][A-Za-z0-9_-]{0,63}" spellcheck="false"><div id="legacy-issue" class="code-block"><pre><code id="issue-command"></code></pre><button class="copy quiet" data-copy="issue-command">Copy</button></div><p class="small muted">Keep the token private. New tokens are shown only once.</p><a href="#admin" id="issue-admin-link" hidden>Open token administration →</a></div></article>
+        <article class="step"><span class="step-number">02</span><div><h2>Onboard your machine</h2><p>Run this in a terminal on the machine you want to connect. The installer prompts for your token and configures the supported clients it finds.</p><div class="code-block"><pre><code id="onboard-command"></code></pre><button class="copy quiet" data-copy="onboard-command">Copy</button></div><p class="small muted">Requires bash, curl and Python 3. Existing client settings are preserved.</p><a href="/clients/onboard.sh" download="onboard.sh">Download or inspect the installer ↗</a></div></article>
+        <article class="step"><span class="step-number">03</span><div><h2>Check the connection</h2><p>Restart your agent to load its new connection, then ask it to recall a topic you’ve saved before.</p><div class="prompt-example">“Use memd to recall my backup setup.”</div><p class="small muted">You can also unlock the Memory index tab with the same token and test a search here.</p><a href="#memory">Open memory index →</a></div></article>
+      </div><aside class="onboarding-aside"><section class="panel"><h3>Included integrations</h3><ul class="integration-list"><li><strong>Claude Code</strong><span>MCP + automatic recall hook</span></li><li><strong>Codex</strong><span>MCP bridge configuration</span></li><li><strong>Claude Desktop</strong><span>Local stdio bridge</span></li><li><strong>pi</strong><span>Memory extension</span></li></ul><p class="small muted">Other MCP clients can use the endpoint below with an Authorization: Bearer header.</p><div class="code-block"><pre><code id="endpoint"></code></pre><button class="copy quiet" data-copy="endpoint">Copy</button></div></section><section class="panel"><h3>Manage access</h3><p class="small muted">Administrators can inspect token names, owners, last use and expiry in the Administration tab. Revocation takes effect immediately.</p><div id="legacy-manage" class="code-block"><pre><code id="manage-command"></code></pre><button class="copy quiet" data-copy="manage-command">Copy</button></div></section><section class="panel"><h3>Client downloads</h3><a href="/clients/memd-mcp-bridge" download>stdio ↔ MCP bridge</a><a href="/clients/memd-recall-hook" download>Claude Code recall hook</a><a href="/clients/pi-memd.ts" download>pi extension</a><a href="/help">Plain text setup reference</a></section></aside></div>
+      <p id="copy-status" class="small muted" role="status"></p>
+    </section>
+    <section id="settings-panel" hidden aria-labelledby="settings-title">
+      <div class="page-heading"><div><p class="eyebrow">MAKE IT YOURS</p><h1 id="settings-title">Settings</h1><p class="muted">Connect memory stores and manage your account.</p></div><button id="store-add" hidden>Add memory store</button></div>
+      <div id="settings-error" class="notice error" role="alert" hidden></div>
+      <div id="stores-list" class="results"></div>
+      <section class="panel account-panel"><h2>Your account</h2><p id="account-name" class="muted"></p><form id="password-form" class="form-grid"><label>Current password<input id="password-current" type="password" autocomplete="current-password" required></label><label>New password<input id="password-new" type="password" minlength="12" autocomplete="new-password" required></label><button>Change password</button></form><p class="small muted">Changing your password signs out all browser sessions. Agent tokens are managed separately.</p></section>
+      <section id="jobs-panel" class="panel" hidden><div class="section-heading"><h2>Connection &amp; indexing activity</h2><button id="jobs-refresh" class="quiet">Refresh</button></div><div id="jobs-list"></div></section>
+    </section>
+    <section id="admin-panel" hidden aria-labelledby="admin-title">
+      <div class="page-heading"><div><p class="eyebrow">ACCESS &amp; CONTROL</p><h1 id="admin-title">Administration</h1><p class="muted">Manage people, agent access and recent changes.</p></div><button id="admin-refresh" class="secondary">Refresh</button></div>
+      <div id="admin-error" class="notice error" role="alert" hidden></div>
+      <section class="panel"><div class="section-heading"><div><h2>Access tokens</h2><p class="small muted">Existing secrets stay masked. New tokens are shown once; revocation takes effect immediately.</p></div><button id="token-add">Issue token</button></div><div class="table-scroll"><table><thead><tr><th>Name / owner</th><th>Store</th><th>Access</th><th>Last used</th><th>Status</th><th></th></tr></thead><tbody id="tokens-table"></tbody></table></div></section>
+      <section class="panel"><div class="section-heading"><div><h2>People</h2><p class="small muted">Accounts start without store access. Administrators can manage every store.</p></div><button id="user-add">Add user</button></div><div class="table-scroll"><table><thead><tr><th>Username</th><th>Role</th><th>Status</th><th>Store access</th><th></th></tr></thead><tbody id="users-table"></tbody></table></div></section>
+      <details class="panel"><summary>Recent administrative activity</summary><div id="audit-list"></div></details>
+    </section>
+  </main>
+  <footer><span>memd <span class="muted">/ Durable memory for your agents</span></span><a href="/health">Service health ↗</a></footer>
+  <dialog id="reader" aria-labelledby="reader-title"><div class="reader-top"><span class="eyebrow">MEMORY</span><button id="reader-close" class="secondary">Close ×</button></div><h2 id="reader-title">Loading…</h2><p id="reader-meta" class="small muted"></p><div id="reader-error" class="notice error" role="alert" hidden></div><pre id="reader-body" class="note-body"></pre><button id="reader-more" class="secondary" hidden>Load more</button></dialog>
+  <dialog id="login-dialog" aria-labelledby="login-title"><div class="reader-top"><h2 id="login-title">Sign in to memd</h2><button type="button" class="quiet" data-close="login-dialog">Close ×</button></div><p class="muted">Use your account to access memory stores and settings.</p><form id="login-form" class="form-grid"><label>Username<input id="login-user" autocomplete="username" required></label><label>Password<input id="login-password" type="password" autocomplete="current-password" required></label><div id="login-error" class="notice error" role="alert" hidden></div><button id="login-submit">Sign in</button></form></dialog>
+  <dialog id="store-dialog" aria-labelledby="store-title"><div class="reader-top"><h2 id="store-title">Memory store</h2><button class="quiet" data-close="store-dialog">Close ×</button></div><form id="store-form" class="form-grid">
+    <div class="form-columns"><label>Store ID<input id="store-id" pattern="[a-z][a-z0-9-]{0,47}" required placeholder="project-notes"></label><label>Display name<input id="store-name" maxlength="120" required placeholder="Project notes"></label></div>
+    <label>Storage<select id="store-kind"><option value="local">Local Markdown with Git history</option><option value="git">Git repository (GitHub, Forgejo, GitLab…)</option><option value="obsidian">Obsidian vault</option><option value="existing" hidden>Existing memory store</option></select></label>
+    <div id="git-fields" class="form-grid" hidden><label>Repository URL<input id="store-remote" placeholder="https://git.example.com/user/notes.git"></label><label>Branch (blank uses repository default)<input id="store-branch" placeholder="main"></label><div class="form-columns"><label>Credential type<select id="store-credential-type"><option value="https">HTTPS access token</option><option value="ssh">SSH private key</option></select></label><label>HTTPS username<input id="store-git-user" placeholder="git"></label></div><label>Credential<textarea id="store-secret" rows="3" autocomplete="off" placeholder="Leave blank to keep the current credential or server identity"></textarea></label><p class="small muted">Credentials are stored in private server files and never returned to the browser.</p></div>
+    <div id="crypt-fields" class="form-grid"><label>Encryption key file (optional)<input id="store-key-file" placeholder="/data/keys/store.key" autocomplete="off"></label><p class="small muted">Encrypts note contents and names in Git. Create the key with <code>mem-crypt keygen</code> (mode 0600) and back it up: without it the store cannot be read.</p></div>
+    <div id="vault-fields" class="form-grid" hidden><label>Vault folder on the server<input id="store-vault" placeholder="/vaults/my-notes"></label><label>Folder for agent memories<input id="store-write-folder" value="Memories"></label><p class="small muted">Mount the vault under an allowed server vault root first. Existing notes are imported read-only; agents write only to the selected memory folder.</p></div>
+    <div class="form-columns"><label>Include patterns (one per line)<textarea id="store-include" rows="3">**/*.md</textarea></label><label>Exclude patterns (one per line)<textarea id="store-exclude" rows="3" placeholder="Private/**"></textarea></label></div>
+    <label>Automatic sync interval (seconds; 0 = manual)<input id="store-interval" type="number" min="0" max="86400" value="300"></label>
+    <div class="check-field"><label class="check"><input id="store-publish-review" type="checkbox" checked aria-describedby="store-publish-review-help">Published notes need review</label><p id="store-publish-review-help" class="small muted">Notes that members publish into this store from another store wait in its review inbox until someone with write access approves them. Clear this to save published notes directly.</p></div>
+    <details><summary>Search services</summary><div class="form-grid"><p class="small muted">Leave blank to use server defaults. Embeddings must be 768-dimensional. Use a new store when changing embedding models for an existing index.</p><label>Embedding service URL<input id="store-embed-url" placeholder="http://embed:8080"></label><label>Embedding model<input id="store-embed-model"></label><label>Reranker service URL<input id="store-rerank-url"></label><label>Reranker model<input id="store-rerank-model"></label></div></details>
+    <div id="store-error" class="notice error" role="alert" hidden></div><button id="store-submit">Save store</button>
+  </form></dialog>
+  <dialog id="user-dialog" aria-labelledby="user-title"><div class="reader-top"><h2 id="user-title">Add user</h2><button class="quiet" data-close="user-dialog">Close ×</button></div><form id="user-form" class="form-grid"><label>Username<input id="user-name" pattern="[a-z][a-z0-9-]{0,47}" required></label><label>Role<select id="user-role"><option value="member">Member</option><option value="admin">Administrator</option></select></label><p class="small muted">A temporary password is generated once. Grant memory store access after creating the account.</p><div id="user-error" class="notice error" role="alert" hidden></div><button>Add user</button></form></dialog>
+  <dialog id="grants-dialog" aria-labelledby="grants-title"><div class="reader-top"><h2 id="grants-title">Store access</h2><button class="quiet" data-close="grants-dialog">Close ×</button></div><form id="grants-form" class="form-grid"><div id="grant-fields"></div><div id="grants-error" class="notice error" role="alert" hidden></div><button>Save access</button></form></dialog>
+  <dialog id="token-dialog" aria-labelledby="token-title"><div class="reader-top"><h2 id="token-title">Issue access token</h2><button class="quiet" data-close="token-dialog">Close ×</button></div><form id="token-form" class="form-grid"><label>Token name<input id="token-name" required maxlength="100" placeholder="laptop-agent"></label><label>Owner<select id="token-user"></select></label><label>Memory store<select id="token-store"></select></label><label>Access<select id="token-scope"><option value="read">Read only</option><option value="write">Read and write</option></select></label><fieldset class="extra-stores" aria-describedby="token-extra-help"><legend>Additional stores (optional)</legend><p id="token-extra-help" class="small muted">Lets this token also recall from, read or publish into other stores. Only stores the owner can access are listed, and the owner’s current access is checked again on every request.</p><div id="token-extra"></div></fieldset><label>Expires after<select id="token-expiry"><option value="90">90 days</option><option value="30">30 days</option><option value="365">1 year</option><option value="0">No expiry</option></select></label><div id="token-error" class="notice error" role="alert" hidden></div><button>Issue token</button></form></dialog>
+  <dialog id="conflicts-dialog" aria-labelledby="conflicts-title"><div class="reader-top"><h2 id="conflicts-title">Resolve vault conflicts</h2><button class="quiet" data-close="conflicts-dialog">Close ×</button></div><p class="small muted">Compare both copies, then choose which to keep. Both versions are archived on the server before resolution.</p><div id="conflicts-error" class="notice error" role="alert" hidden></div><div id="conflicts-list"></div></dialog>
+  <dialog id="secret-dialog" aria-labelledby="secret-title"><div class="reader-top"><h2 id="secret-title">Save this credential</h2><button class="quiet" data-close="secret-dialog">Done</button></div><p id="secret-description" class="muted"></p><div class="code-block"><pre><code id="new-secret"></code></pre><button id="secret-copy" class="copy quiet">Copy</button></div><p class="small muted">This value is shown once. It will not appear in the account or token list.</p></dialog>
+  <noscript><p class="notice">JavaScript is needed for the memory index. <a href="/help">Open the setup reference</a>.</p></noscript>
+</body>
+</html>

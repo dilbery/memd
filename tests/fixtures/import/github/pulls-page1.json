@@ -1,0 +1,36 @@
+[
+  {
+    "number": 42, "title": "Switch the index to sqlite-vec",
+    "html_url": "https://github.com/example-org/widgets/pull/42",
+    "merged_at": "2026-05-02T10:00:00Z", "updated_at": "2026-05-03T10:00:00Z",
+    "labels": [{"name": "architecture"}],
+    "body": "<!-- PR template: describe your change -->\n## Summary\nThis swaps the vector store.\n\n## Decision\nWe use sqlite-vec instead of a separate vector database, so backups stay a single file.\n\n## Checklist\n- [x] tests\n- [x] docs\n"
+  },
+  {
+    "number": 41, "title": "Drop Python 3.12",
+    "html_url": "https://github.com/example-org/widgets/pull/41",
+    "merged_at": "2026-04-20T10:00:00Z", "updated_at": "2026-04-21T10:00:00Z",
+    "labels": [],
+    "body": "Bumps CI.\n\nBREAKING CHANGE: Python 3.12 is no longer supported; install on 3.13.\n\nAlso fixes a typo."
+  },
+  {
+    "number": 40, "title": "Fix typo in README",
+    "html_url": "https://github.com/example-org/widgets/pull/40",
+    "merged_at": "2026-04-18T10:00:00Z", "updated_at": "2026-04-18T11:00:00Z",
+    "labels": [],
+    "body": "Just a typo."
+  },
+  {
+    "number": 39, "title": "Closed without merging",
+    "html_url": "https://github.com/example-org/widgets/pull/39",
+    "merged_at": null, "updated_at": "2026-04-10T10:00:00Z",
+    "body": "## Rationale\nNever merged, never imported."
+  },
+  {
+    "number": 38, "title": "Rotate the deploy token",
+    "html_url": "https://github.com/example-org/widgets/pull/38",
+    "merged_at": "2026-03-01T10:00:00Z", "updated_at": "2026-03-01T10:00:00Z",
+    "labels": [],
+    "body": "## Why\nThe old deploy_token=placeholderplaceholder leaked in a log, so we decided to rotate it weekly."
+  }
+]

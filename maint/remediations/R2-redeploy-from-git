@@ -1,0 +1,7 @@
+#!/bin/sh
+# R2 — full redeploy from Forgejo main via the canonical deploy script.
+# For: deploy drift (C9) or a stale image; also heals code-level regressions
+# that a newer main has already fixed.
+set -eu
+ssh -o BatchMode=yes -o ConnectTimeout=15 "${MEMD_DEPLOY_SSH:-svcuser@10.10.1.10}" '~/docker/memd/deploy.sh'
+echo "R2: redeployed from git"

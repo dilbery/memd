@@ -1,0 +1,13 @@
+[Unit]
+Description=memd guard — health watcher; restarts memd on its own failure, Pushover on recovery; upstream 5xx/refused = DEGRADE not crash
+After=memd.service
+Wants=memd.service
+
+[Service]
+Type=simple
+ExecStart=/usr/local/bin/memd-guard-loop
+Restart=always
+RestartSec=10s
+
+[Install]
+WantedBy=multi-user.target

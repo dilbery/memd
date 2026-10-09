@@ -1,0 +1,130 @@
+#!/usr/bin/env python3
+"""memd-token: manage the bearer token file memd reads on every request.
+
+  memd-token [--file PATH] issue  <label>   print a new token once, append "<label> <token>"
+  memd-token [--file PATH] revoke <label>   remove that label's line(s)
+  memd-token [--file PATH] list             labels only, never tokens
+
+PATH defaults to $MEMD_TOKENS_FILE, else ./tokens. The file is rewritten atomically and
+keeps its mode (0600 on creation), so a reader never sees a half-written file.
+
+memd re-reads the token file on every request, so issue and revoke take effect at once.
+That only holds when the container mounts the DIRECTORY: a single-file bind mount keeps
+the old inode after os.replace and the change is invisible until the container is
+recreated. See docs/DEPLOYMENT.md.
+"""
+from __future__ import annotations
+
+import argparse
+import os
+import secrets
+import sys
+import tempfile
+
+if os.environ.get("MEMD_CONTROL_DB"):
+    sys.exit("The registry owns token access. Use memd-control list / issue / revoke; the old token file is inactive.")
+
+TOKEN_PREFIX = "mem_"
+
+
+def _read(path: str) -> list[str]:
+    try:
+        with open(path, encoding="utf-8") as fh:
+            return fh.read().splitlines()
+    except FileNotFoundError:
+        return []
+
+
+def _write(path: str, lines: list[str]) -> None:
+    """Replace the file atomically, preserving its mode."""
+    if os.path.exists(os.path.join(os.path.dirname(os.path.abspath(path)), ".registry-active")):
+        sys.exit("Token file retired: use the memd admin console or memd-control.")
+    mode = 0o600
+    try:
+        mode = os.stat(path).st_mode & 0o777
+    except FileNotFoundError:
+        pass
+    directory = os.path.dirname(os.path.abspath(path)) or "."
+    fd, tmp = tempfile.mkstemp(prefix=".memd-tokens-", dir=directory)
+    try:
+        with os.fdopen(fd, "w", encoding="utf-8") as out:
+            for line in lines:
+                out.write(line)
+                out.write("\n")
+            out.flush()
+            os.fsync(out.fileno())
+        os.chmod(tmp, mode)
+        os.replace(tmp, path)
+        tmp = None
+    finally:
+        if tmp is not None and os.path.exists(tmp):
+            os.unlink(tmp)
+
+
+def _entries(lines: list[str]) -> list[tuple[str, str]]:
+    """(label, token) for every real entry, ignoring blanks and comments.
+
+    Matches memd.mcp_http.load_tokens: split on the first run of whitespace, and
+    silently ignore a line without a separator so a typo cannot lock everyone out.
+    """
+    out = []
+    for line in lines:
+        stripped = line.strip()
+        if not stripped or stripped.startswith("#"):
+            continue
+        parts = stripped.split(None, 1)
+        if len(parts) == 2 and parts[0] and parts[1].strip():
+            out.append((parts[0], parts[1].strip()))
+    return out
+
+
+def main(argv: list[str] | None = None) -> int:
+    parser = argparse.ArgumentParser(prog="memd-token", description=__doc__.splitlines()[0])
+    parser.add_argument("--file", default=os.environ.get("MEMD_TOKENS_FILE") or "tokens")
+    sub = parser.add_subparsers(dest="cmd", required=True)
+    sub.add_parser("issue").add_argument("label")
+    sub.add_parser("revoke").add_argument("label")
+    sub.add_parser("list")
+    args = parser.parse_args(argv)
+
+    lines = _read(args.file)
+    labels = [label for label, _ in _entries(lines)]
+
+    if args.cmd == "list":
+        for label in labels:
+            print(label)
+        return 0
+
+    if not args.label or any(char.isspace() for char in args.label) or args.label.startswith("#"):
+        print("label must be one word and cannot start with #", file=sys.stderr)
+        return 2
+
+    if args.cmd == "issue":
+        if args.label in labels:
+            print(f"label {args.label!r} already exists; revoke it first", file=sys.stderr)
+            return 2
+        token = TOKEN_PREFIX + secrets.token_urlsafe(36)
+        _write(args.file, lines + [f"{args.label} {token}"])
+        print(token)
+        return 0
+
+    if args.cmd == "revoke":
+        if args.label not in labels:
+            print(f"no token labelled {args.label!r}", file=sys.stderr)
+            return 2
+        keep = []
+        for line in lines:
+            stripped = line.strip()
+            if stripped and not stripped.startswith("#"):
+                parts = stripped.split(None, 1)
+                if len(parts) == 2 and parts[0] == args.label:
+                    continue
+            keep.append(line)
+        _write(args.file, keep)
+        return 0
+
+    return 2
+
+
+if __name__ == "__main__":
+    sys.exit(main())

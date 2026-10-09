@@ -1,0 +1,4 @@
+#!/bin/sh
+# R5 — no action; the re-check itself is the remediation.
+# For: evidence that reads as a transient network blip.
+echo "R5: no action (transient suspected)"

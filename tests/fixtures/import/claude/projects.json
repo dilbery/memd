@@ -1,0 +1,15 @@
+[
+  {
+    "uuid": "p-0001",
+    "name": "Homelab",
+    "description": "Notes about the homelab: vmhost runs the containers, lapbox holds the archive.",
+    "prompt_template": "Answer tersely and name hosts explicitly.",
+    "created_at": "2026-01-10T12:00:00Z",
+    "docs": [
+      {"uuid": "d-0001", "filename": "network.md", "content": "The LAN uses 10.10.1.0/24 and the gateway is 10.10.1.1.", "created_at": "2026-01-11T12:00:00Z"},
+      {"uuid": "d-0002", "filename": "empty.md", "content": ""}
+    ]
+  },
+  {"uuid": "p-0002", "name": "Bare project"},
+  null
+]

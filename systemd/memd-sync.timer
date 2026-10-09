@@ -1,0 +1,10 @@
+[Unit]
+Description=Periodic memd index sync (pull amber clone + reindex)
+
+[Timer]
+OnBootSec=3min
+OnUnitActiveSec=10min
+Persistent=true
+
+[Install]
+WantedBy=timers.target

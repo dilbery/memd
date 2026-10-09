@@ -1,0 +1,56 @@
+name: ci
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+permissions:
+  contents: read
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: astral-sh/setup-uv@v6
+      - name: Install
+        run: |
+          uv venv --python 3.13 .venv
+          uv pip install --python .venv/bin/python -e '.[dev]'
+      - name: Test
+        run: .venv/bin/python -m pytest -q -p no:cacheprovider
+      - name: Recall eval (public synthetic set)
+        # No model service on a runner: the hash embedder and fused order measure the
+        # retrieval pipeline, not semantic quality (eval/README.md). Fails when recall
+        # got worse than eval/public/baseline.json; the table goes to the job summary.
+        run: |
+          .venv/bin/python -m memd.recall_eval --golden eval/public/golden.jsonl \
+            --corpus eval/public/corpus --embedder hash --rerank none \
+            --baseline eval/public/baseline.json --markdown "$GITHUB_STEP_SUMMARY"
+
+  secrets:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+      - name: Scan for committed credentials
+        # Pinned release binary; gitleaks-action needs a licence for organisation repos.
+        run: |
+          curl -fsSL https://github.com/gitleaks/gitleaks/releases/download/v8.28.0/gitleaks_8.28.0_linux_x64.tar.gz \
+            | tar -xz gitleaks
+          ./gitleaks git --redact --no-banner --log-opts="${{ github.event_name == 'pull_request' && format('{0}..{1}', github.event.pull_request.base.sha, github.sha) || '-n 50' }}" .
+
+  privacy:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Scan for private terms
+        # PRIVATE_TERMS is a repository secret (one term per line). Pull requests
+        # from forks do not receive secrets, so the scan is skipped there.
+        env:
+          PRIVATE_TERMS: ${{ secrets.PRIVATE_TERMS }}
+        run: |
+          if [ -z "$PRIVATE_TERMS" ]; then echo "PRIVATE_TERMS secret not set; skipping"; exit 0; fi
+          python3 maint/privacy-scan --require-terms

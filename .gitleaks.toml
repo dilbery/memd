@@ -1,0 +1,11 @@
+# gitleaks configuration: the default rules plus a narrow exception for test
+# fixtures that exist to exercise secret redaction.
+[extend]
+useDefault = true
+
+# tests/fixtures/import/ holds synthetic exports whose fake secrets
+# ("api_key=placeholder...") exist to prove mem-import redacts them.
+[[rules]]
+id = "generic-api-key"
+[[rules.allowlists]]
+paths = ['''^tests/fixtures/import/''']

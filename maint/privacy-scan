@@ -1,0 +1,117 @@
+#!/usr/bin/env python3
+"""Fail when a tracked (or staged) file mentions a private term.
+
+The repository is public, so the terms themselves never live in it (not even
+hashed: a dictionary recovers common names from a hash). They come from:
+
+  PRIVATE_TERMS        newline- or comma-separated (the CI secret)
+  PRIVATE_TERMS_FILE   a file of one term per line, '#' comments allowed
+                       (default ~/.config/memd/private-terms)
+
+Matches are whole words, case-insensitive, in file contents and paths. Output
+names the file, line and term NUMBER only, so a CI log never republishes a term.
+
+  maint/privacy-scan               scan every tracked file
+  maint/privacy-scan --staged      scan the staged versions (pre-commit)
+  maint/privacy-scan --history     scan every commit's metadata and diff, all refs
+  maint/privacy-scan --install-hook   add a pre-commit hook that runs --staged
+  maint/privacy-scan --require-terms  fail instead of skipping when no terms are set
+"""
+from __future__ import annotations
+
+import os
+import re
+import subprocess
+import sys
+from pathlib import Path
+
+DEFAULT_FILE = Path.home() / ".config" / "memd" / "private-terms"
+
+
+def load_terms() -> list[str]:
+    raw = os.environ.get("PRIVATE_TERMS", "")
+    path = Path(os.environ.get("PRIVATE_TERMS_FILE") or DEFAULT_FILE)
+    if path.is_file():
+        raw += "\n" + path.read_text()
+    terms = []
+    for line in re.split(r"[\n,]", raw):
+        term = line.split("#", 1)[0].strip()
+        if term and term.casefold() not in terms:
+            terms.append(term.casefold())
+    return terms
+
+
+def git(*args: str) -> bytes:
+    return subprocess.run(["git", *args], check=True, capture_output=True).stdout
+
+
+def files(staged: bool) -> list[str]:
+    if staged:
+        out = git("diff", "--cached", "--name-only", "--diff-filter=ACMR", "-z")
+    else:
+        out = git("ls-files", "-z")
+    return [f for f in out.decode().split("\0") if f]
+
+
+def content(path: str, staged: bool) -> str | None:
+    try:
+        data = git("show", f":{path}") if staged else Path(path).read_bytes()
+    except (OSError, subprocess.CalledProcessError):
+        return None
+    if b"\0" in data[:8192]:
+        return None  # binary
+    return data.decode("utf-8", errors="replace")
+
+
+def main(argv: list[str]) -> int:
+    if "--install-hook" in argv:
+        hook = Path(git("rev-parse", "--git-path", "hooks").decode().strip()) / "pre-commit"
+        hook.parent.mkdir(parents=True, exist_ok=True)
+        hook.write_text('#!/bin/sh\nexec "$(git rev-parse --show-toplevel)/maint/privacy-scan" --staged\n')
+        hook.chmod(0o755)
+        print(f"installed {hook}")
+        return 0
+    staged = "--staged" in argv
+    terms = load_terms()
+    if not terms:
+        print("privacy-scan: no private terms configured; skipping", file=sys.stderr)
+        return 1 if "--require-terms" in argv else 0
+    pattern = re.compile(
+        r"(?<![a-z0-9])(" + "|".join(re.escape(t) for t in terms) + r")(?![a-z0-9])", re.IGNORECASE)
+    index = {t: n for n, t in enumerate(terms, 1)}
+    hits = 0
+    if "--history" in argv:
+        log = git("log", "--all", "-p", "--no-color", "--format=commit %H%n%an <%ae>%n%cn <%ce>%n%B")
+        commit = "?"
+        for line in log.decode("utf-8", errors="replace").splitlines():
+            if line.startswith("commit ") and len(line) == 47:
+                commit = line[7:19]
+                continue
+            for match in pattern.finditer(line):
+                hits += 1
+                print(f"commit {commit}: private term #{index[match.group(1).casefold()]}")
+        return report(hits, terms)
+    for path in files(staged):
+        for match in pattern.finditer(path):
+            hits += 1
+            print(f"{path}: path contains private term #{index[match.group(1).casefold()]}")
+        text = content(path, staged)
+        if text is None:
+            continue
+        for lineno, line in enumerate(text.splitlines(), 1):
+            for match in pattern.finditer(line):
+                hits += 1
+                print(f"{path}:{lineno}: private term #{index[match.group(1).casefold()]}")
+    return report(hits, terms)
+
+
+def report(hits: int, terms: list[str]) -> int:
+    if hits:
+        print(f"privacy-scan: {hits} private term occurrence(s)", file=sys.stderr)
+        return 1
+    print(f"privacy-scan: clean ({len(terms)} terms)")
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main(sys.argv[1:]))

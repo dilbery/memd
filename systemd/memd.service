@@ -1,0 +1,21 @@
+[Unit]
+Description=memd — recall/save service (RAG over the git memory store)
+Documentation=https://git.example.com/svcuser/memd
+# No hard dependency on the embedding/rerank backends: memd degrades gracefully if they are down.
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=svcuser
+Group=svcuser
+# MEMD_PROFILE selects the per-profile clone/db; MEMD_TOKEN guards /save. 0600 file.
+EnvironmentFile=/home/svcuser/.config/memd/env
+ExecStart=/home/svcuser/projects/memd/.venv/bin/uvicorn memd.server:app --host 127.0.0.1 --port 8077
+Restart=on-failure
+RestartSec=3
+TimeoutStartSec=30
+# memd writes only under ~/.memd and ~/.config/memd; never the live store.
+
+[Install]
+WantedBy=multi-user.target

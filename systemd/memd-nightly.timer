@@ -1,0 +1,11 @@
+[Unit]
+Description=Run memd nightly jobs
+
+[Timer]
+# After memd-reflect (03:30) so both review branches reflect the same night's store.
+OnCalendar=*-*-* 04:05:00
+RandomizedDelaySec=10m
+Persistent=true
+
+[Install]
+WantedBy=timers.target

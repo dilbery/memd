@@ -1,0 +1,11 @@
+#!/bin/sh
+# R3 — reinstall the MCP bridge from the repo clone.
+# For: bridge drift (C8) or a broken installed bridge (C7).
+set -eu
+REPO="${MEMD_DOCTOR_REPO:-$(cd "$(dirname "$0")/../.." && pwd)}"
+BRIDGE="${MEMD_DOCTOR_BRIDGE:-$HOME/.local/bin/memd-mcp-bridge}"
+git -C "$REPO" pull --ff-only >/dev/null 2>&1 || true
+cp "$REPO/clients/memd-mcp-bridge" "$BRIDGE"
+chmod +x "$BRIDGE"
+MEMD_ENV_FILE="${MEMD_DOCTOR_ENV_DIR:-$HOME/.config/memd}/memd-claude.env" "$BRIDGE" --selftest
+echo "R3: bridge resynced from repo"

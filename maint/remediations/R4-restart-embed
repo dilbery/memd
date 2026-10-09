@@ -1,0 +1,8 @@
+#!/bin/sh
+# R4 — restart the embedding container on apphost.
+# For: the embed sub-check failing inside C1/C2 (recall silently degrades to
+# lexical-only without it).
+set -eu
+ssh -o BatchMode=yes -o ConnectTimeout=15 "${MEMD_DEPLOY_SSH:-svcuser@10.10.1.10}" \
+    'cd ~/docker/memd && docker compose restart embed'
+echo "R4: restarted embed"
