@@ -1,4 +1,34 @@
-# memd — shared durable memory for agents
+<p align="center">
+  <img src="docs/images/logo.svg" width="72" height="72" alt="memd logo">
+</p>
+
+<h1 align="center">memd</h1>
+
+<p align="center">
+  <strong>Shared, durable memory for AI agents.</strong><br>
+  Git-backed Markdown you own, served over MCP and HTTP, with search and a web dashboard.
+</p>
+
+<p align="center">
+  <a href="https://github.com/dilbery/memd/actions/workflows/ci.yml"><img src="https://github.com/dilbery/memd/actions/workflows/ci.yml/badge.svg?branch=main" alt="CI"></a>
+  <img src="https://img.shields.io/badge/python-3.13-147d70" alt="Python 3.13">
+  <img src="https://img.shields.io/badge/MCP-server-147d70" alt="MCP server">
+  <a href="LICENSING.md"><img src="https://img.shields.io/badge/license-PolyForm%20Noncommercial-147d70" alt="Licence: PolyForm Noncommercial with internal-use permission"></a>
+</p>
+
+<p align="center">
+  <a href="#install">Install</a> ·
+  <a href="#web-dashboard">Dashboard</a> ·
+  <a href="#connect-a-client">Connect a client</a> ·
+  <a href="#use-memory">Use memory</a> ·
+  <a href="docs/OPERATING.md">Operating guide</a> ·
+  <a href="LICENSING.md">Licensing</a>
+</p>
+
+<picture>
+  <source media="(prefers-color-scheme: dark)" srcset="docs/images/index-dark.webp">
+  <img src="docs/images/index-light.webp" alt="The memd memory index: live service health, index coverage and a searchable list of notes">
+</picture>
 
 memd is a self-hosted memory server for AI coding agents and assistants. It is for
 individuals and small teams who run agents on several machines and want them to share
@@ -12,6 +42,79 @@ a rebuildable search index. Notes remain readable, diffable and reviewable.
 Clients connect remotely; they do not need their own memory clone or embedding
 service. Separate profiles use isolated stores and credentials. An optional
 reranker improves result ordering; keyword retrieval works without model services.
+
+## Highlights
+
+- **Plain files, real history.** Every memory is a Markdown note in a Git repository.
+  Read it, grep it, diff it, revert it; the search index can always be rebuilt from Git.
+- **One memory for every agent.** Claude Code, Codex, Claude Desktop, pi and any MCP
+  client share the same store, with a recall hook that brings relevant notes into
+  each prompt.
+- **Hybrid search.** Keyword (FTS5) and semantic (sqlite-vec) retrieval are fused, with
+  an optional cross-encoder reranker. Works keyword-only with no model services at all.
+- **Memory that stays true.** Health reports for stale, unused and contradicting notes,
+  timeline facts, self-checking probes, and a review inbox for proposed changes.
+  Nothing is deleted without review.
+- **Built for more than one person.** Accounts, scoped expiring tokens, per-user stores,
+  team sharing, encrypted personal stores, OIDC and an audit trail.
+- **Small to run.** One container, SQLite, no external assets or build step for the
+  dashboard. Light and dark mode on any screen size.
+
+## Screenshots
+
+The screenshots use the fictional home-lab notes from the public eval corpus
+(`eval/public`). They follow your system's light or dark theme.
+
+<table>
+  <tr>
+    <td width="50%">
+      <picture>
+        <source media="(prefers-color-scheme: dark)" srcset="docs/images/search-dark.webp">
+        <img src="docs/images/search-light.webp" alt="Search results for a natural-language query">
+      </picture>
+      <p align="center"><b>Search</b>: semantic and keyword search across every note</p>
+    </td>
+    <td width="50%">
+      <picture>
+        <source media="(prefers-color-scheme: dark)" srcset="docs/images/reader-dark.webp">
+        <img src="docs/images/reader-light.webp" alt="The note reader showing one memory in full">
+      </picture>
+      <p align="center"><b>Note reader</b>: the full note, revision-guarded, never executable HTML</p>
+    </td>
+  </tr>
+  <tr>
+    <td width="50%">
+      <picture>
+        <source media="(prefers-color-scheme: dark)" srcset="docs/images/health-dark.webp">
+        <img src="docs/images/health-light.webp" alt="Memory health tiles and the age-by-tag staleness heatmap">
+      </picture>
+      <p align="center"><b>Memory health</b>: what is stale, unused or contradicting itself</p>
+    </td>
+    <td width="50%">
+      <picture>
+        <source media="(prefers-color-scheme: dark)" srcset="docs/images/entities-dark.webp">
+        <img src="docs/images/entities-light.webp" alt="Entity cards for hosts and tags with note and staleness counts">
+      </picture>
+      <p align="center"><b>Entities</b>: everything memory knows about one host, service or tag</p>
+    </td>
+  </tr>
+  <tr>
+    <td width="50%">
+      <picture>
+        <source media="(prefers-color-scheme: dark)" srcset="docs/images/onboarding-dark.webp">
+        <img src="docs/images/onboarding-light.webp" alt="Onboarding steps with copyable commands and the included integrations">
+      </picture>
+      <p align="center"><b>Onboarding</b>: one command connects a machine's agents</p>
+    </td>
+    <td width="50%">
+      <picture>
+        <source media="(prefers-color-scheme: dark)" srcset="docs/images/admin-dark.webp">
+        <img src="docs/images/admin-light.webp" alt="Administration of access tokens and user accounts">
+      </picture>
+      <p align="center"><b>Administration</b>: people, scoped tokens and the audit trail</p>
+    </td>
+  </tr>
+</table>
 
 See [OPERATING.md](docs/OPERATING.md) for deployment, configuration and recovery.
 
