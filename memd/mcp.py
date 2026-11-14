@@ -96,7 +96,32 @@ PROPOSE_OUTPUT = {
         "message": {"type": "string"},
         "lint": {"type": "object", "description": (
             "What saving it would do: action (create/update/supersede), slug, related, "
-            "near_duplicates, conflicts, warnings, and error when save would refuse it.")},
+            "near_duplicates, conflicts, warnings, and error when save would refuse it. Also "
+            "pending_duplicates (id and title): your own proposals still waiting for review that "
+            "this one restates, never anyone else's.")},
+    },
+}
+_PROPOSAL_ITEM = {"type": "object", "properties": {
+    "id": {"type": "string"}, "status": {"type": "string", "enum": ["pending", "approved", "rejected"]},
+    "created": {"type": "number", "description": "When it was proposed (epoch seconds)."},
+    "source": {"type": "string", "description": "How it arrived: agent (propose), save (a queued save), handoff, publish, ..."},
+    "title": {"type": "string"}, "excerpt": {"type": "string"},
+    "body": {"type": "string", "description": "The full text; only when asked for by id."},
+    "decided_at": {"type": ["number", "null"]}, "reviewer": {"type": ["string", "null"]},
+    "reason": {"type": ["string", "null"], "description": "Why it was rejected, when the reviewer said."},
+    "slug": {"type": ["string", "null"], "description": "The saved note, once approved; read(slug) returns it."},
+    "revision": {"type": ["string", "null"]},
+    "edited": {"type": "boolean", "description": "The reviewer changed it before approving; the text shown is what was saved."},
+    "last_error": {"type": ["string", "null"], "description": "Why an approval attempt failed; it is still pending."},
+}}
+PROPOSALS_OUTPUT = {
+    "type": "object", "properties": {
+        **_ERROR_FIELDS, "ok": {"type": "boolean"}, "profile": {"type": "string"},
+        "items": {"type": "array", "items": _PROPOSAL_ITEM},
+        "total": {"type": "integer", "description": "Your candidates with the requested status."},
+        "counts": {"type": "object", "description": "Your candidates by status: pending, approved, rejected."},
+        "offset": {"type": "integer"},
+        "proposal": {**_PROPOSAL_ITEM, "description": "The one candidate asked for by id, with its full text."},
     },
 }
 READ_OUTPUT = {
@@ -272,6 +297,9 @@ async def list_tools() -> list[types.Tool]:
                         "each result is labelled [store]. Omit for your own store only.")},
                     "scope": {"type": "string", "enum": ["all"], "description": (
                         "\"all\": recall across every store you have access to.")},
+                    "deadline_ms": {"type": ["number", "string"], "description": (
+                        "With stores/scope only: milliseconds to wait for the stores (100 or more; it can "
+                        "only shorten the server's own deadline). A store still running is skipped and named.")},
                     "k": {
                         "type": ["integer", "string"],
                         "description": "Max query matches before the character budget (default 8, max 50).",
@@ -442,6 +470,32 @@ async def list_tools() -> list[types.Tool]:
         inputSchema=copy.deepcopy(save_schema),
     ))
     tools.append(types.Tool(
+        name="proposals",
+        annotations=types.ToolAnnotations(readOnlyHint=True, destructiveHint=False, idempotentHint=True, openWorldHint=False),
+        outputSchema=PROPOSALS_OUTPUT,
+        description=(
+            "What became of the facts you proposed: the candidates this credential filed with propose "
+            "(or with a save that was queued for review), newest first, each with its status "
+            "(pending, approved, rejected), the reviewer, the rejection reason, and the slug and "
+            "revision once approved. Read-only. Pass `id` for one candidate with its full text. "
+            "Lists only your own proposals; a rejected one is not saved, so read its reason before "
+            "proposing the fact again."
+        ),
+        inputSchema={
+            "type": "object", "required": [], "properties": {
+                "status": {"type": "string", "enum": ["pending", "approved", "rejected", "all"],
+                           "description": "Which candidates to list (default pending)."},
+                "id": {"type": "string", "description": (
+                    "A candidate id from propose (or a queued save's inbox_id): return that one, "
+                    "with its full text, instead of a list.")},
+                "limit": {"type": ["integer", "string"], "description": "Candidates per page, 1..200 (default 20)."},
+                "offset": {"type": ["integer", "string"], "description": "Candidates to skip (default 0)."},
+                "store": {"type": "string", "description": "Store to look in; defaults to your own."},
+                "profile": {"type": "string", "description": "Owner profile; defaults to the serving instance."},
+            },
+        },
+    ))
+    tools.append(types.Tool(
         name="publish",
         annotations=types.ToolAnnotations(readOnlyHint=False, destructiveHint=False, idempotentHint=True, openWorldHint=False),
         outputSchema=PUBLISH_OUTPUT,
@@ -484,11 +538,11 @@ def _federation(arguments: dict) -> list[str] | None:
 
 
 def _federated_recall(args: dict, stores: list[str]) -> types.CallToolResult:
-    from memd.share import federated_recall
+    from memd.share import deadline_ms, federated_recall
 
     def one(store, query, k, **kw):
         return _core_recall(query, profile=store, k=k, cfg=_cfg_for(store), **kw)
-    out = federated_recall(args, stores, one)
+    out = federated_recall(args, stores, one, budget_ms=deadline_ms(args.get("deadline_ms")))
     shaped = out["shaped"]
     shaped["text"] = shaped.get("text") or "No matching memory notes."
     # One recall_id, logged in each store's usage log with that store's matches.
@@ -528,8 +582,9 @@ def _result(payload: dict, *, text: str | None = None, error: bool = False) -> t
 def _propose(fact: dict, profile: str, *, source: str = "agent") -> dict:
     """File a candidate in the store's review inbox (memd.inbox)."""
     from memd import inbox
-    from memd.actor import get_actor
-    return inbox.propose(fact, profile, cfg=_cfg_for(profile), source=source, proposer=get_actor())
+    from memd.actor import caller
+    who = caller()
+    return inbox.propose(fact, profile, cfg=_cfg_for(profile), source=source, proposer=who.label, caller=who)
 
 
 def _call_tool_sync(name: str, arguments: dict[str, Any]) -> types.CallToolResult:
@@ -580,9 +635,10 @@ def _call_tool_sync(name: str, arguments: dict[str, Any]) -> types.CallToolResul
         profile = resolve_profile(enforce("save", fact.pop("profile", None)))
         authorize(profile, write=True)
         from memd import inbox
-        if inbox.save_routes_to_inbox():
-            # MEMD_SAVE_MODE=inbox: an agent token's save waits for review.
-            return _result(inbox.queued_receipt(_propose(fact, profile, source="save")))
+        if inbox.save_routes_to_inbox(profile):
+            # The store's review policy, or MEMD_SAVE_MODE=inbox: this save waits for review.
+            return _result(inbox.queued_receipt(_propose(fact, profile, source="save"),
+                                                inbox.review_policy(profile)))
         receipt = _core_save(fact, profile=profile, cfg=_cfg_for(profile)).to_dict()
         failed = receipt.get("saved") is False or receipt.get("ok") is False
         return _result(receipt, error=failed)
@@ -593,6 +649,21 @@ def _call_tool_sync(name: str, arguments: dict[str, Any]) -> types.CallToolResul
         profile = resolve_profile(enforce("save", fact.pop("profile", None)))
         authorize(profile, write=True)
         return _result(_propose(fact, profile))
+
+    if name == "proposals":
+        # The caller's own candidates (memd.inbox), authorised as a read of the store.
+        from memd import inbox
+        from memd.actor import caller
+        from memd.share import store_argument
+        arguments = arguments or {}
+        profile = resolve_profile(enforce("read", store_argument(arguments)))
+        cfg = _cfg_for(profile)
+        if arguments.get("id") is not None:
+            return _result({"ok": True, "profile": profile,
+                            "proposal": inbox.own_proposal(cfg, profile, caller(), arguments["id"])})
+        return _result({**inbox.own_proposals(cfg, profile, caller(), status=arguments.get("status") or "pending",
+                                              limit=arguments.get("limit", 20), offset=arguments.get("offset", 0)),
+                        "profile": profile})
 
     if name == "timeline":
         from memd.facts import timeline

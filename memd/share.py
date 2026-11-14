@@ -9,10 +9,11 @@ it as ``profile`` on an ordinary call, and every store is resolved separately:
 * **publish** copies one note from a store the caller may read (the source,
   default their own) into a store they may write (the target) through the
   target's normal save path, or its review inbox when the target has
-  ``publish_review`` on (the default) or agent saves are queued
-  (MEMD_SAVE_MODE=inbox). The copy carries ``published_from: {store, slug,
-  revision, by, at}``; publishing the same note again updates that copy (found
-  by its provenance, never by title), and an unchanged source is a no-op.
+  ``publish_review`` on (the default) or the caller's saves into it are queued
+  (the target's review policy, or MEMD_SAVE_MODE=inbox). The copy carries
+  ``published_from: {store, slug, revision, by, at}``; publishing the same note
+  again updates that copy (found by its provenance, never by title), and an
+  unchanged source is a no-op.
 * **federated recall** runs recall once per requested store (``stores`` list, or
   ``scope: "all"`` for every store the caller is granted), in parallel with a
   cap and one shared deadline, fuses the per-store rankings by reciprocal rank
@@ -381,9 +382,12 @@ def publish(slug: str, target_store: str, *, source_store: str | None = None,
     target_ref = {"store": target, "slug": fact["slug"]}
 
     from memd import inbox
-    if publish_review(target) or inbox.save_routes_to_inbox():
-        proposed = inbox.propose(fact, target, cfg=tgt_cfg, source="publish", proposer=get_actor(),
-                                 provenance=provenance)
+    # The target's review policy can hold a publish back even with publish_review off.
+    if publish_review(target) or inbox.save_routes_to_inbox(target):
+        from memd.actor import caller
+        who = caller()
+        proposed = inbox.propose(fact, target, cfg=tgt_cfg, source="publish", proposer=who.label,
+                                 provenance=provenance, caller=who)
         return {"ok": True, "action": "queued", "queued": True, "inbox_id": proposed["id"],
                 "duplicate": proposed.get("duplicate", False), "source": src_ref,
                 "target": {**target_ref, "revision": None}, "published_from": provenance,
@@ -457,10 +461,16 @@ def resolve_stores(stores=None, scope=None, *, operation: str = "recall") -> lis
     return readable_stores(operation)
 
 
-def deadline_ms() -> int:
-    """One budget for the whole federated recall: embed + rerank deadlines + slack."""
+def deadline_ms(requested: int | None = None) -> int:
+    """One budget for the whole federated recall: embed + rerank deadlines + slack.
+
+    `requested` is the caller's own ``deadline_ms``: it can only shorten the
+    budget, and not below 100 ms.
+    """
     from memd.config import Config
     from memd.profiles import effective_environment
+    if requested is not None:
+        return min(deadline_ms(), max(100, int(requested)))
     env = effective_environment()
     override = (env.get("MEMD_FEDERATED_DEADLINE_MS") or "").strip()
     if override:
@@ -533,8 +543,13 @@ def federated_recall(args: dict, stores: list[str], recall_one, *, budget_ms: in
 
     `args` is memd.normalize.normalize_recall_args output; ``recall_one(store,
     query, k, **filters)`` runs one ordinary single-store recall.
+
+    The rendered text stays within max_chars including its two additions: for a
+    present-state query, the current-facts block of the first store (when that
+    store was searched), and one closing line naming every skipped store.
     """
-    from memd.render import render_result
+    from memd.recall import CURRENT_INTENT
+    from memd.render import DEFAULT_MAX_CHARS, _number, render_result
     kw = {} if args.get("include_core", True) else {"include_core": False}
     for key in ("host", "tags", "include_archived"):
         if args.get(key):
@@ -543,9 +558,26 @@ def federated_recall(args: dict, stores: list[str], recall_one, *, budget_ms: in
     notes, skipped = federate(stores, lambda store: recall_one(store, query, k, **kw), k=k,
                               budget_ms=budget_ms)
     annotate_upstream(notes, operation="recall")
-    shaped = render_result(notes, top_n=k, max_chars=args.get("max_chars", 14000), query=query,
-                           core_limit=args.get("core_limit"), include_core=args.get("include_core", True))
     missed = {row["store"] for row in skipped}
+    budget = _number(args.get("max_chars", 14000), DEFAULT_MAX_CHARS, 256, 100000)
+    closing = ""
+    if skipped:
+        closing = "[Stores not searched: " + ", ".join(f"{row['store']} ({row['reason']})" for row in skipped) + ".]"
+    # The notes and the facts block share what the closing line leaves.
+    room = budget - len(closing) - 2 if closing else budget
+    shaped = render_result(notes, top_n=k, max_chars=room, query=query,
+                           core_limit=args.get("core_limit"), include_core=args.get("include_core", True))
+    if query and CURRENT_INTENT.search(query) and room >= 256 and stores and stores[0] not in missed:
+        try:
+            from memd.facts import append_current_facts
+            append_current_facts(shaped, query=query, db_path=_paths(stores[0])[2], max_chars=room,
+                                 store=stores[0])
+        except Exception:
+            pass    # the facts block is optional; recall itself already succeeded
+    if closing:
+        # Rendering never budgets below 256 characters, so a smaller room is cut to fit here.
+        text = (shaped.get("text") or "")[:max(0, room)].rstrip()
+        shaped["text"] = (f"{text}\n\n{closing}" if text else closing)[:budget]
     return {"notes": notes, "shaped": shaped, "stores": [s for s in stores if s not in missed],
             "stores_skipped": skipped}
 

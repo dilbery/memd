@@ -553,14 +553,14 @@ def test_new_handoff_replaces_previous_pending_for_same_repo(store):
 
 def test_approved_handoff_is_a_low_importance_state_note_updated_in_place(store):
     cid = inbox.propose(_fact(body="First state of play."), "amber", cfg=store, proposer="laptop")["id"]
-    receipt = inbox.approve(store, "amber", cid, reviewer="owner")["receipt"]
+    receipt = inbox.approve(store, "amber", cid, reviewer=inbox.operator_reviewer("owner"))["receipt"]
     assert receipt["saved"] is True
     notes = [n for n in list_notes(store.clone) if "handoff" in (n.tags or [])]
     [note] = notes
     assert note.importance == 1 and note.volatility == "state"
     assert "repo:git.example.com/team/widget" in note.tags
     cid = inbox.propose(_fact(body="Second state of play."), "amber", cfg=store, proposer="laptop")["id"]
-    inbox.approve(store, "amber", cid, reviewer="owner")
+    inbox.approve(store, "amber", cid, reviewer=inbox.operator_reviewer("owner"))
     notes = [n for n in list_notes(store.clone) if "handoff" in (n.tags or [])]
     assert len(notes) == 1 and "Second state" in notes[0].body
 
@@ -569,7 +569,7 @@ def test_latest_prefers_newest_and_limits_pending_to_the_proposer(store):
     now = time.time()
     inbox.propose(_fact(body="Old approved state."), "amber", cfg=store, proposer="laptop", now=now - 7200)
     [old] = inbox.list_candidates(store, "amber")["items"]
-    inbox.approve(store, "amber", old["id"], reviewer="owner")
+    inbox.approve(store, "amber", old["id"], reviewer=inbox.operator_reviewer("owner"))
     inbox.propose(_fact(body="Newer pending state."), "amber", cfg=store, proposer="laptop", now=now - 60)
     key = "git.example.com/team/widget"
     found = handoff.latest(store, "amber", key, proposer="laptop", now=now)
@@ -673,6 +673,57 @@ def test_handoff_route_is_per_store_and_per_credential(stores):
         "Other store state."
     assert api.get("/handoff", headers=laptop, params={"repo": key}).json()["handoff"]["text"] == \
         "Retry done; backoff next."
+
+
+def test_tokens_sharing_a_label_keep_their_pending_handoffs_apart(stores, config):
+    api, issue = stores
+    first, second = issue("shared", "amber"), issue("shared", "amber")
+    key = "git.example.com/team/widget"
+
+    def text(headers):
+        found = api.get("/handoff", headers=headers, params={"repo": key}).json()["handoff"]
+        return found and found["text"]
+    assert api.post("/propose", headers=first, json=_fact(body="First token's state.")).status_code == 200
+    assert text(first) == "First token's state." and text(second) is None
+    # The second token's handoff is its own: it neither shows nor replaces the first's.
+    assert api.post("/propose", headers=second, json=_fact(body="Second token's state.")).status_code == 200
+    assert text(first) == "First token's state." and text(second) == "Second token's state."
+    # Each still replaces its own older one.
+    assert api.post("/propose", headers=first, json=_fact(body="First token, later.")).status_code == 200
+    assert text(first) == "First token, later." and text(second) == "Second token's state."
+    items = inbox.list_candidates(config, "amber")["items"]
+    assert [i["proposer"] for i in items] == ["shared", "shared"]
+
+
+def test_a_handoff_without_ids_is_still_matched_by_label(store):
+    key = "git.example.com/team/widget"
+    # Filed in process, or before ids were recorded: only the label says whose it is.
+    old = inbox.propose(_fact(body="Filed without ids."), "amber", cfg=store, proposer="legacy")["id"]
+    with TestClient(server_mod.create_token_app()) as client:
+        found = client.get("/handoff", headers=AUTH, params={"repo": key}).json()["handoff"]
+        assert found["status"] == "pending" and found["text"] == "Filed without ids."
+        # The same label's next handoff replaces it, and carries the credential from then on.
+        assert client.post("/propose", headers=AUTH, json=_fact(body="Filed with ids.")).status_code == 200
+        assert client.get("/handoff", headers=AUTH, params={"repo": key}).json()["handoff"]["text"] == \
+            "Filed with ids."
+    [item] = inbox.list_candidates(store, "amber")["items"]
+    assert item["id"] != old and item["proposer"] == "legacy"
+    assert handoff.latest(store, "amber", key, proposer="legacy") is None
+    credential = "legacy:" + control.digest(TOKEN)[:12]
+    assert handoff.latest(store, "amber", key, proposer="renamed", credential=credential)["text"] == "Filed with ids."
+
+
+def test_sessions_share_a_credential_and_are_told_apart_by_account(store):
+    key = "git.example.com/team/widget"
+    inbox.propose(_fact(body="Amber's session state."), "amber", cfg=store, proposer="amber",
+                  caller=actor.Caller("amber", "u-1", "session"))
+    assert handoff.latest(store, "amber", key, proposer="amber", account="u-2", credential="session") is None
+    assert handoff.latest(store, "amber", key, proposer="amber", account="u-1", credential="session")["text"] == \
+        "Amber's session state."
+    # Another account's session files its own handoff; it does not replace the first.
+    inbox.propose(_fact(body="Cobalt's session state."), "amber", cfg=store, proposer="cobalt",
+                  caller=actor.Caller("cobalt", "u-2", "session"))
+    assert inbox.list_candidates(store, "amber")["total"] == 2
 
 
 def test_server_serves_the_handoff_hook():

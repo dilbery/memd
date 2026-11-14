@@ -22,10 +22,17 @@ class Principal:
     session: bool = False
     csrf: str = ""
     token_id: str = ""
+    # The stores whose review inbox this caller may decide (memd.inbox). Its own
+    # capability beside `grants`: write does not imply it, and it does not imply write.
+    reviews: frozenset[str] = frozenset()
 
 
 current: ContextVar[Principal | None] = ContextVar("memd_principal", default=None)
 remote_request: ContextVar[bool] = ContextVar("memd_remote", default=False)
+# The one store an approval in progress may write, so that a reviewer without
+# write access can approve. Only memd.inbox.approve sets it, in the copied
+# context its save runs in; a request's own context never holds it.
+approved_write: ContextVar[str | None] = ContextVar("memd_approved_write", default=None)
 # True when the caller was authenticated by the token-registry/Kasm/OIDC layer
 # (memd.authentication) rather than an administered account. That layer then
 # decides the store: memd.registry.enforce and the bound identity in
@@ -37,11 +44,16 @@ def user_principal(c, user, *, session=False, csrf=""):
     if user["disabled"]:
         return None
     admin = user["role"] == "admin"
-    grants = ({row[0]: "write" for row in c.execute("SELECT id FROM stores")} if admin else
-              {r[0]:r[1] for r in c.execute("SELECT store_id,permission FROM grants WHERE user_id=?", (user["id"],))})
+    if admin:
+        grants = {row[0]: "write" for row in c.execute("SELECT id FROM stores")}
+        reviews = frozenset(grants)
+    else:
+        rows = c.execute("SELECT store_id,permission,review FROM grants WHERE user_id=?", (user["id"],)).fetchall()
+        grants = {r[0]:r[1] for r in rows}
+        reviews = frozenset(r[0] for r in rows if r[2])
     serving = (os.environ.get("MEMD_PROFILE") or default_profile())
     default = serving if serving in grants else next(iter(grants), "")
-    return Principal(user["id"],user["username"],admin,grants,default,session,csrf)
+    return Principal(user["id"],user["username"],admin,grants,default,session,csrf,reviews=reviews)
 
 
 def authenticate_token(value):
@@ -76,8 +88,11 @@ def authenticate_token(value):
                         held = principal.grants.get(key)
                         if held and key not in grants and wanted in {"read", "write"}:
                             grants[key] = "write" if held == wanted == "write" else "read"
+                    # Review, only for a token issued with it: where it reaches AND
+                    # its owner may review now, so the owner's loss is the token's.
+                    reviews = frozenset(grants) & principal.reviews if record["review"] else frozenset()
                     c.execute("UPDATE tokens SET last_used=? WHERE id=?",(now,record["id"]))
-                    return Principal(user["id"],record["label"],False,grants,record["store_id"],token_id=record["id"])
+                    return Principal(user["id"],record["label"],False,grants,record["store_id"],token_id=record["id"],reviews=reviews)
     # Legacy credentials retain only the serving instance's store, never admin.
     # MEMD_CONTROL_DB is a one-way cutover: once the token registry is on, the
     # legacy file is never consulted again (docs/ADMIN-WEB.md).
@@ -142,7 +157,9 @@ def authorize(profile=None, *, write=False):
         return profile  # Local CLI/stdio, or an explicitly open configuration.
     selected = profile or principal.default
     scope = principal.grants.get(selected)
-    if not scope or (write and scope != "write"):
+    # An approval's save (memd.inbox.approve) may write the one store it names,
+    # for a reviewer who holds a grant there but not write.
+    if not scope or (write and scope != "write" and approved_write.get() != selected):
         raise PermissionError("This identity does not have the required store access.")
     return selected
 

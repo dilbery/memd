@@ -17,6 +17,10 @@ This module is the store side:
     pending candidate only when the caller proposed it (pending text is not
     readable by other credentials), or an approved one whose note still exists.
     Text only; never another store's.
+
+"The same proposer" is the same credential (``_same_proposer``), not the same
+label: two tokens may share a label, and a user's second token does not read
+the first one's pending text.
 """
 from __future__ import annotations
 
@@ -51,14 +55,30 @@ def repo_key(fact: dict) -> str | None:
     return repos[0]
 
 
-def replace_pending(conn, repo: str, proposer: str, keep_id: str) -> int:
-    """Delete ``proposer``'s other pending handoffs for ``repo``; the number removed.
+def _same_proposer(row, proposer: str, account: str | None, credential: str | None) -> bool:
+    """Whether the caller with this label and these ids filed the candidate.
+
+    Ids decide when the candidate has them: the credential, together with the
+    account because every browser session carries the same credential. One
+    without ids was filed by a local caller or before ids were recorded, and is
+    matched by label.
+    """
+    if row["proposer_credential"]:
+        return (row["proposer_credential"], row["proposer_account"]) == (credential, account)
+    return row["proposer"] == proposer
+
+
+def replace_pending(conn, repo: str, proposer: str, keep_id: str, *, account: str | None = None,
+                    credential: str | None = None) -> int:
+    """Delete the same proposer's other pending handoffs for ``repo``; the number removed.
 
     They were never reviewed, and only the newest says where the work stands.
     """
     stale = []
-    for row in conn.execute("SELECT id, meta FROM candidates WHERE status='pending' AND source=? "
-                            "AND proposer=? AND id<>?", (SOURCE, proposer, keep_id)):
+    for row in conn.execute("SELECT id, meta, proposer, proposer_account, proposer_credential FROM candidates "
+                            "WHERE status='pending' AND source=? AND id<>?", (SOURCE, keep_id)):
+        if not _same_proposer(row, proposer, account, credential):
+            continue
         try:
             meta = json.loads(row["meta"] or "{}")
         except ValueError:
@@ -77,13 +97,16 @@ def max_age_days(value, default: int = DEFAULT_MAX_AGE_DAYS) -> int:
         return default
 
 
-def latest(cfg, profile: str, repo: str, *, proposer: str, max_age: int = DEFAULT_MAX_AGE_DAYS,
+def latest(cfg, profile: str, repo: str, *, proposer: str, account: str | None = None,
+           credential: str | None = None, max_age: int = DEFAULT_MAX_AGE_DAYS,
            now: float | None = None) -> dict | None:
     """The newest handoff for ``repo`` in this store, or None.
 
     Returns ``{repo, status, as_of, text}``: ``status`` is ``pending`` (a
-    candidate the same ``proposer`` filed) or ``approved`` (the saved note's
-    current text); ``as_of`` is when the handoff was written (epoch seconds).
+    candidate the same proposer filed: ``account`` and ``credential`` are a
+    remote caller's ids, memd.actor.caller; a local caller is its ``proposer``
+    label) or ``approved`` (the saved note's current text); ``as_of`` is when
+    the handoff was written (epoch seconds).
     """
     from memd import inbox
     from memd.profiles import guard_paths
@@ -111,7 +134,7 @@ def latest(cfg, profile: str, repo: str, *, proposer: str, max_age: int = DEFAUL
         if repo_key(meta) != repo:
             continue
         if row["status"] == "pending":
-            if row["proposer"] != proposer:
+            if not _same_proposer(row, proposer, account, credential):
                 continue
             text = row["body"]
         else:

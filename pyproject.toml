@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "memd"
-version = "0.1.0"
+version = "0.2.0"
 description = "memd — git-markdown memory store acceleration and write hygiene"
 requires-python = ">=3.13,<3.14"
 license = "LicenseRef-PolyForm-Noncommercial-1.0.0-with-Internal-Use"  # see LICENSE

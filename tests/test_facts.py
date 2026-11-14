@@ -411,6 +411,23 @@ def test_current_facts_block_gated_on_intent_and_budget(indexed):
         assert untouched == {"text": "t"}
 
 
+def test_current_facts_block_names_the_store_when_given_one(indexed):
+    query = "where does the nginx proxy run now?"
+
+    def block(max_chars=14000, **kw):
+        return fx.append_current_facts({"text": "n" * 300}, query=query, db_path=indexed.db,
+                                       max_chars=max_chars, **kw)
+    plain = block()
+    assert block(store=None) == plain and plain["text"].count("### Current facts (timeline)\n") == 1
+    named = block(store="team")
+    assert named["text"] == plain["text"].replace("### Current facts", "### [team] Current facts")
+    assert named["current_facts"] == plain["current_facts"] == 1
+    # The label counts against the budget.
+    exact = len(plain["text"])
+    assert block(exact) == plain and block(exact, store="team") == {"text": "n" * 300}
+    assert block(exact + len("[team] "), store="team") == named
+
+
 def test_current_facts_block_ignores_index_without_fact_tables(tmp_path):
     path = tmp_path / "old.db"
     sqlite3.connect(path).execute("CREATE TABLE notes(slug TEXT)").connection.commit()

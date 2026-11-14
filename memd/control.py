@@ -30,7 +30,7 @@ def db():
     connection.row_factory = sqlite3.Row
     try:
         connection.execute("PRAGMA foreign_keys=ON")
-        connection.execute("PRAGMA journal_mode=WAL")
+        _wal(connection)
         yield connection
         connection.commit()
     except Exception:
@@ -38,6 +38,25 @@ def db():
         raise
     finally:
         connection.close()
+
+
+def _wal(connection):
+    """Switch the database to WAL, waiting for a connection that is making the same switch.
+
+    Only a database not yet in WAL mode takes a lock for this, and SQLite
+    refuses that lock at once, without the busy timeout, when two connections
+    ask for it together: instances that share a new database and start at the
+    same moment. On every later connection the pragma changes nothing.
+    """
+    deadline = time.monotonic() + 15
+    while True:
+        try:
+            connection.execute("PRAGMA journal_mode=WAL")
+            return
+        except sqlite3.OperationalError as exc:
+            if "locked" not in str(exc) or time.monotonic() > deadline:
+                raise
+            time.sleep(0.02)
 
 
 def initialize():
@@ -72,11 +91,47 @@ def initialize():
         CREATE UNIQUE INDEX IF NOT EXISTS one_running_job ON jobs(store_id)
             WHERE state IN ('queued','running');
         """)
-        # Additional stores a token may reach ({store: read|write}), each still
-        # intersected with the owner's current grants on every request.
-        if "extra" not in {r[1] for r in c.execute("PRAGMA table_info(tokens)")}:
-            c.execute("ALTER TABLE tokens ADD COLUMN extra TEXT NOT NULL DEFAULT '{}'")
+    _add_columns()
     os.chmod(os.environ["MEMD_ADMIN_DB"], 0o600)
+
+
+def _add_columns():
+    """Add the columns an earlier database lacks, each with its backfill, in one transaction.
+
+    sqlite3's implicit transactions would commit an ALTER before the UPDATE that
+    follows it. A failure between the two would leave the column in place and
+    its backfill skipped for good, because the column check then passes. So
+    this connection is in autocommit mode and the transaction is explicit.
+
+    The column lists are read after the write lock is taken: instances that
+    share this database and start together then cannot both decide to add a
+    column, and the later one finds nothing left to do.
+    """
+    connection = sqlite3.connect(os.environ["MEMD_ADMIN_DB"], timeout=15, isolation_level=None)
+    try:
+        connection.execute("BEGIN IMMEDIATE")
+        try:
+            grants = {r[1] for r in connection.execute("PRAGMA table_info(grants)")}
+            tokens = {r[1] for r in connection.execute("PRAGMA table_info(tokens)")}
+            if "review" not in grants:
+                connection.execute("ALTER TABLE grants ADD COLUMN review INTEGER NOT NULL DEFAULT 0")
+                # Until review was its own flag, write included it. Only here, when
+                # the column is new: a later run must not undo a review since removed.
+                connection.execute("UPDATE grants SET review=1 WHERE permission='write'")
+            # Whether a token carries its owner's review (memd.access), off unless issued with it.
+            if "review" not in tokens:
+                connection.execute("ALTER TABLE tokens ADD COLUMN review INTEGER NOT NULL DEFAULT 0")
+            # Additional stores a token may reach ({store: read|write}), each still
+            # intersected with the owner's current grants on every request.
+            if "extra" not in tokens:
+                connection.execute("ALTER TABLE tokens ADD COLUMN extra TEXT NOT NULL DEFAULT '{}'")
+            connection.execute("COMMIT")
+        except BaseException:
+            if connection.in_transaction:
+                connection.execute("ROLLBACK")
+            raise
+    finally:
+        connection.close()
 
 
 def digest(value):
@@ -189,6 +244,22 @@ def audit_read(action, target):
         pass  # auditing must never turn a working read into a 500
 
 
+def audit_decision(action, actor, target):
+    """Record a review decision (memd.inbox). Best effort, like audit_read.
+
+    The decision is already made when this runs, so a failure here must not
+    reach the reviewer as one. Without MEMD_ADMIN_DB it does nothing: the inbox
+    row's own reviewer and time are then the only record.
+    """
+    if not enabled():
+        return
+    try:
+        with db() as c:
+            audit(c, actor or "anonymous", action, str(target)[:200])
+    except Exception:
+        pass
+
+
 # Read entries are high volume (the recall hook runs on every prompt), so they
 # expire; administrative entries (logins, tokens, grants, exports) are kept.
 READ_AUDIT_ACTIONS = ("recall", "recall.federated", "read")
@@ -254,9 +325,19 @@ def put_store(profile, name, kind, config, *, actor="operator", create=False):
         if create:
             c.execute("INSERT INTO stores VALUES(?,?,?,?,?)", (profile,name,kind,json.dumps(config),time.time()))
         else:
+            before = c.execute("SELECT config FROM stores WHERE id=?", (profile,)).fetchone()
             if not c.execute("UPDATE stores SET name=?,kind=?,config=? WHERE id=?", (name,kind,json.dumps(config),profile)).rowcount:
                 raise ValueError("Unknown store.")
         audit(c, actor, "store.create" if create else "store.update", profile)
+        if not create:
+            # Whoever may change the policy can step around it (under four-eyes
+            # not even an administrator approves their own save), so a change
+            # is named in the log with what it was and what it became.
+            from memd.inbox import review_policy
+            old = review_policy(profile, config=json.loads(before["config"]))
+            new = review_policy(profile, config=config)
+            if old != new:
+                audit(c, actor, "store.review_policy", f"{profile}:{old}->{new}")
 
 
 def register_existing():
@@ -277,13 +358,29 @@ def register_existing():
 
 
 def public_store(row):
+    from memd.inbox import review_policy
     cfg = row["config"]
     return {"id": row["id"], "name": row["name"], "kind": row["kind"], "config": {
         key: cfg.get(key) for key in ("repo_ssh", "branch", "vault_path", "include", "exclude",
                                      "write_folder", "sync_interval", "embed_url", "embed_model",
                                      "rerank_url", "rerank_model", "git_username", "key_file")},
         "has_credential": bool(cfg.get("credential")), "managed": bool(cfg.get("managed")),
-        "encrypted": bool(cfg.get("key_file")), "publish_review": publish_review(row)}
+        "encrypted": bool(cfg.get("key_file")), "publish_review": publish_review(row),
+        # The effective policy, as publish_review is: the setting, else the environment, else open.
+        "review_policy": review_policy(row["id"], config=cfg), "reviewers": reviewers(row["id"])}
+
+
+def reviewers(profile):
+    """How many enabled accounts may review this store, administrators included.
+
+    Settings warns when it is below two: under the four-eyes policy a candidate
+    is decided from an account other than its proposer's, so a lone reviewer
+    could have nothing of their own approved.
+    """
+    with db() as c:
+        return c.execute("SELECT COUNT(*) FROM users u WHERE u.disabled=0 AND (u.role='admin' OR EXISTS("
+                         "SELECT 1 FROM grants g WHERE g.user_id=u.id AND g.store_id=? AND g.review=1))",
+                         (profile,)).fetchone()[0]
 
 
 def publish_review(row):
@@ -310,8 +407,8 @@ def token_records(legacy_tokens=None, profile=None, *, preserve_master=False):
                     continue
                 if row["digest"] not in live:
                     c.execute("UPDATE tokens SET revoked=? WHERE id=?",(now,row["id"]))
-        rows = c.execute("SELECT t.id,t.label,t.store_id,t.scope,t.masked,t.legacy,t.created,t.last_used,t.expires,t.revoked,t.extra,u.username FROM tokens t LEFT JOIN users u ON t.user_id=u.id ORDER BY t.created DESC").fetchall()
-    return [{**dict(r), "extra": json.loads(r["extra"] or "{}")} for r in rows]
+        rows = c.execute("SELECT t.id,t.label,t.store_id,t.scope,t.masked,t.legacy,t.created,t.last_used,t.expires,t.revoked,t.extra,t.review,u.username FROM tokens t LEFT JOIN users u ON t.user_id=u.id ORDER BY t.created DESC").fetchall()
+    return [{**dict(r), "extra": json.loads(r["extra"] or "{}"), "review": bool(r["review"])} for r in rows]
 
 
 def refresh_legacy_files():
@@ -335,13 +432,19 @@ def refresh_legacy_files():
 MAX_EXTRA_STORES = 15
 
 
-def issue_token(label, user_id, profile, scope, expires, *, actor, extra_stores=None):
+def issue_token(label, user_id, profile, scope, expires, *, actor, extra_stores=None, review=False):
     """Issue a token for one store, plus optional `extra_stores` ({store: read|write}).
 
     Extra stores let one agent token publish between stores and recall across
     them (memd.share). Each is checked against the user's grants now and, like
     the main store, intersected with them again on every request.
+
+    `review` lets the token review the inbox of those of its stores that its
+    owner may review, again decided on every request (memd.access). It is
+    refused for an owner who may review none of them.
     """
+    if not isinstance(review, bool):
+        raise ValueError("Review must be true or false.")
     extra = {} if extra_stores is None else extra_stores
     if not isinstance(extra, dict) or len(extra) > MAX_EXTRA_STORES:
         raise ValueError(f"Additional stores must be an object of at most {MAX_EXTRA_STORES} stores.")
@@ -374,9 +477,14 @@ def issue_token(label, user_id, profile, scope, expires, *, actor, extra_stores=
             grant = c.execute("SELECT permission FROM grants WHERE user_id=? AND store_id=?", (user_id,key)).fetchone()
             if user["role"] != "admin" and (not grant or (wanted == "write" and grant[0] != "write")):
                 raise ValueError("The user does not have the requested access to an additional store.")
-        c.execute("INSERT INTO tokens(id,digest,label,user_id,store_id,scope,masked,created,expires,extra) VALUES(?,?,?,?,?,?,?,?,?,?)",
+        if review and user["role"] != "admin":
+            marks = ",".join("?" * (1 + len(extra)))
+            if not c.execute(f"SELECT 1 FROM grants WHERE user_id=? AND review=1 AND store_id IN ({marks})",
+                             (user_id, profile, *extra)).fetchone():
+                raise ValueError("The user does not hold review on any of this token's stores.")
+        c.execute("INSERT INTO tokens(id,digest,label,user_id,store_id,scope,masked,created,expires,extra,review) VALUES(?,?,?,?,?,?,?,?,?,?,?)",
                   (tid,digest(value),label.strip(),user_id,profile,scope,"••••"+value[-4:],time.time(),expires,
-                   json.dumps(dict(sorted(extra.items())))))
+                   json.dumps(dict(sorted(extra.items()))),int(review)))
         audit(c,actor,"token.issue",tid)
     return {"id": tid, "token": value}
 

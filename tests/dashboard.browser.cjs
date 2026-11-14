@@ -45,7 +45,7 @@ const entityPage = {ok:true,profile:'test',generated_at:'2026-01-02T03:04:05Z',c
 const note = i => ({slug:'note-'+i,title:i === 0 ? '<img src=x onerror=alert(1)>' : 'Memory '+i,host:'node-a',importance:3,tags:i === 1 ? ['backup'] : [],body:'A durable note about backup configuration and restore procedures.'});
 const server = createServer((req,res) => {
   const name = req.url === '/' ? 'index.html' : req.url.replace('/ui/assets/', '');
-  if (!['index.html','app.js','admin.js','health.js','entities.js','style.css','icon.svg'].includes(name)) {res.writeHead(404).end();return;}
+  if (!['index.html','app.js','admin.js','health.js','entities.js','inbox.js','style.css','icon.svg'].includes(name)) {res.writeHead(404).end();return;}
   res.setHeader('Content-Type', {'html':'text/html','css':'text/css','js':'text/javascript','svg':'image/svg+xml'}[name.split('.').pop()]);
   res.end(readFileSync(path.join(root,name)));
 });
@@ -98,6 +98,7 @@ const server = createServer((req,res) => {
     await page.fill('#token','browser-test'); await page.click('#unlock-btn');
     await page.waitForSelector('.note-card'); assert.equal(await page.locator('.note-card').count(),24);
     assert.equal(await page.locator('.note-card img').count(),0);
+    assert.equal(await page.locator('#tab-inbox').isVisible(),false);     // a token unlock is not a signed-in session
     await page.click('#next'); await page.waitForFunction(() => document.querySelector('#page-label').textContent.startsWith('25'));
     await page.click('#previous'); await page.waitForFunction(() => document.querySelector('#page-label').textContent.startsWith('1–'));
     // Tag chips filter from the keyboard (the card is a button, so the chip is role=button).
@@ -168,7 +169,7 @@ const server = createServer((req,res) => {
     assert.match(sections,/web proxy · runs on · node-a/);
     assert.match(sections,/Showing 2 of 60/);
     assert.match(sections,/verification failed 2026-01-01: tcp node-a:53: refused/);
-    assert.match(sections,/2 candidates wait for review. Sign in with write access/);
+    assert.match(sections,/2 candidates wait for review. Sign in with review access/);
     assert.match(sections,/2025-06-01 → 2026-01-01/);
     await page.click('#entity-sections .note-link >> text=Memory 3'); await page.waitForSelector('#reader[open]');
     await page.waitForFunction(() => document.querySelector('#reader-title').textContent === 'Example memory');

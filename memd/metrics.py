@@ -36,10 +36,10 @@ MAX_STORES = 100
 GAUGE_TTL = 15.0
 START_TIME = time.time()
 
-ROUTES = ("recall", "read", "save", "propose", "ask", "publish", "timeline", "mcp", "health",
-          "stats", "metrics", "insights", "entities", "inbox", "handoff", "reindex", "ui",
+ROUTES = ("recall", "read", "save", "propose", "proposals", "ask", "publish", "timeline", "mcp",
+          "health", "stats", "metrics", "insights", "entities", "inbox", "handoff", "reindex", "ui",
           "admin", "clients", "other")
-TOOLS = ("recall", "read", "save", "propose", "ask", "publish", "timeline", "other")
+TOOLS = ("recall", "read", "save", "propose", "proposals", "ask", "publish", "timeline", "other")
 STATUS = ("1xx", "2xx", "3xx", "4xx", "5xx")
 BACKENDS = ("embed", "rerank", "chat")
 ERROR_KINDS = ("timeout", "connect", "http_4xx", "http_5xx", "bad_response", "other")
@@ -213,8 +213,8 @@ def reset() -> None:
 
 
 _ROUTE_PREFIXES = {
-    "recall": "recall", "read": "read", "save": "save", "propose": "propose", "ask": "ask",
-    "publish": "publish", "timeline": "timeline", "mcp": "mcp", "health": "health",
+    "recall": "recall", "read": "read", "save": "save", "propose": "propose", "proposals": "proposals",
+    "ask": "ask", "publish": "publish", "timeline": "timeline", "mcp": "mcp", "health": "health",
     "stats": "stats", "metrics": "metrics", "insights": "insights", "entities": "entities",
     "inbox": "inbox", "handoff": "handoff", "reindex": "reindex", "ui": "ui", "admin": "admin",
     "api": "admin", "memories": "ui", "sso": "ui", "clients": "clients", "help": "ui",

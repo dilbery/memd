@@ -279,7 +279,19 @@ def c5() -> tuple[str, str]:
 
     if not isinstance(parsed, dict):
         return ("FAIL", "invalid JSON response")
-    
+
+    # A store whose review policy queues this token's save answers with a queued
+    # receipt. The save path works; nothing is written until someone approves it.
+    inbox_id = parsed.get("inbox_id")
+    if "error" not in parsed and parsed.get("queued") is True and isinstance(inbox_id, str) and inbox_id:
+        # Its slug is where an approval would save it. Anything but the probe's
+        # own is the fork the check below fails a direct save for.
+        if parsed.get("slug") != PROBE_SLUG:
+            return ("FAIL", f"queued probe {inbox_id} would not update {PROBE_SLUG!r} when approved "
+                    f"(slug {parsed.get('slug')!r}): {str(parsed.get('warnings'))[:300]}")
+        STATE['queued'] = inbox_id
+        return ("PASS", f"queued for review: candidate {inbox_id} waits in the inbox, nothing was saved")
+
     if ("error" in parsed or parsed.get("saved") is not True
             or not parsed.get("revision") or parsed.get("lexical_indexed") is not True):
         return ("FAIL", f"save/keyword visibility not confirmed: {parsed}")
@@ -288,13 +300,15 @@ def c5() -> tuple[str, str]:
         return ("FAIL", f"probe save forked to {parsed.get('slug')!r} instead of updating {PROBE_SLUG!r}")
 
     STATE['nonce_a'] = nonce_a
-    return ("PASS", f"action={parsed.get('action')} nonce={nonce_a} "
+    return ("PASS", f"saved: action={parsed.get('action')} nonce={nonce_a} "
             f"indexed={parsed.get('indexed')} synced={parsed.get('synced')}")
 
 
 def c6() -> tuple[str, str]:
     """C6 — the write round-tripped."""
     if 'nonce_a' not in STATE:
+        if STATE.get('queued'):
+            return ("SKIP", "the C5 probe waits for review; there is nothing to read back")
         return ("SKIP", "no nonce from C5")
 
     token = read_token(TOKEN_ENV_FILE)
@@ -412,6 +426,10 @@ def c12():
         return ("SKIP", "no nonce")
     status, text = mcp_call("recall", {"query": nonce_b}, token)
     if status != 200 or nonce_b not in (text or ""):
+        if status == 200 and STATE.get('queued'):
+            # A store that queued the C5 probe queues omp's save into it as well.
+            return ("SKIP", "the store queues agent saves, so the omp probe waits for review; "
+                    "there is nothing to read back")
         return ("FAIL", "omp reported success but the nonce never reached the server")
     return ("PASS", "omp-written nonce retrieved")
 

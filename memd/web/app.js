@@ -5,6 +5,14 @@
   let continuation = null, statsBusy = false, statsGeneration = 0;
   let identity = {enabled: false, authenticated: false};
   const hasAccess = () => !!token || (!!identity.session && !!identity.stores?.length);
+  // Review is its own capability beside read and write. An older server
+  // reports only the permission, where write carried review.
+  const canReview = entry => !!(entry.review ?? (entry.permission === "write"));
+  // Only a signed-in session reviews here: a token unlock never does.
+  const reviewStores = () => identity.session ? (identity.stores || []).filter(canReview) : [];
+  // What a store holds back for review, as the server reports it. An older
+  // server reports nothing, which is "open"; so is a value this page does not know.
+  const reviewPolicy = entry => ["agents", "four-eyes"].includes(entry?.review_policy) ? entry.review_policy : "open";
   const pageSize = 24;
   const number = value => Number(value || 0).toLocaleString();
   const put = (id, value) => { $(id).textContent = value; };
@@ -27,7 +35,13 @@
         body: body === undefined ? undefined : JSON.stringify(body), signal: controller.signal,
         cache: "no-store", credentials: credential ? "omit" : "same-origin"});
       if (response.status === 401) throw new Error("Access token not accepted. Unlock with a current token.");
-      if (response.status === 403) throw new Error("This token or profile cannot access this memory store.");
+      if (response.status === 403) {
+        // The wording suits a locked store. A view that shows the server's own
+        // reason (the inbox) reads it from error.detail.
+        const refused = new Error("This token or profile cannot access this memory store.");
+        try { const detail = (await response.json()).detail; if (typeof detail === "string") refused.detail = detail; } catch {}
+        throw refused;
+      }
       let data;
       try { data = await response.json(); } catch { throw new Error("The server returned an unexpected response. Try again shortly."); }
       if (!response.ok || data.ok === false) throw new Error(data.detail || data.err || data.error || `Request failed (${response.status}).`);
@@ -39,14 +53,14 @@
   }
   function tab() {
     const requested = location.hash.slice(1).split("/")[0];
-    const allowed = ["memory", "health", "entities", "onboarding", ...(identity.session ? ["settings"] : []), ...(identity.admin ? ["admin"] : [])];
+    const allowed = ["memory", "health", "entities", "onboarding", ...(reviewStores().length ? ["inbox"] : []), ...(identity.session ? ["settings"] : []), ...(identity.admin ? ["admin"] : [])];
     const selected = allowed.includes(requested) ? requested : "memory";
-    ["memory", "health", "entities", "onboarding", "settings", "admin"].forEach(name => {
+    ["memory", "health", "entities", "inbox", "onboarding", "settings", "admin"].forEach(name => {
       $(name + "-panel").hidden = name !== selected;
       if (name === selected) $("tab-" + name).setAttribute("aria-current", "page");
       else $("tab-" + name).removeAttribute("aria-current");
     });
-    document.title = "memd · " + ({memory:"Memory index",health:"Memory health",entities:"Entities",onboarding:"Onboarding",settings:"Settings",admin:"Administration"}[selected]);
+    document.title = "memd · " + ({memory:"Memory index",health:"Memory health",entities:"Entities",inbox:"Inbox",onboarding:"Onboarding",settings:"Settings",admin:"Administration"}[selected]);
     dispatchEvent(new CustomEvent("memd-tab", {detail: selected}));
   }
 
@@ -195,12 +209,13 @@
       notice("search-error", error.message); empty("Search couldn’t complete", "Try again, or browse your indexed notes."); put("result-count", "");
     } finally { if (request === generation) busy(false); }
   }
-  async function readNote(slug, more = false) {
+  // `store` names a store other than the selected one (the inbox reviews its own).
+  async function readNote(slug, more = false, store = profile === "PROFILE" ? undefined : profile) {
     const request = ++readerGeneration;
     if (!more) { continuation = null; put("reader-title", "Loading memory…"); put("reader-meta", ""); put("reader-body", ""); $("reader").showModal(); }
     notice("reader-error"); $("reader-more").hidden = true;
     try {
-      const d = await api("/read", more ? continuation : {slug, profile: profile === "PROFILE" ? undefined : profile, limit: 16000});
+      const d = await api("/read", more ? continuation : {slug, profile: store, limit: 16000});
       if (request !== readerGeneration) return;
       put("reader-title", d.title || d.slug);
       put("reader-meta", [d.profile, d.verified_at ? "Verified " + d.verified_at : null, "Revision " + (d.revision || "unknown").slice(0, 12)].filter(Boolean).join(" · "));
@@ -256,6 +271,7 @@
     $("issue-admin-link").hidden = !identity.admin;
     $("login-open").hidden = !identity.enabled || identity.session;
     $("logout").hidden = !identity.session;
+    $("tab-inbox").hidden = !reviewStores().length;
     $("tab-settings").hidden = !identity.session;
     $("tab-admin").hidden = !identity.admin;
     $("lock").hidden = !token;
@@ -278,7 +294,7 @@
     empty("Loading store…", ""); notice("search-error"); refreshStatus(true); browse(); commands();
   });
   window.memd = {api, notice, element, loadIdentity, identity: () => identity,
-    readNote, hasAccess, profile: () => profile,
+    readNote, hasAccess, profile: () => profile, canReview, reviewStores, reviewPolicy,
     signOut: async () => { await api("/ui/logout", {}); identity = {enabled:true,authenticated:false}; lock();
       ["notes", "vectors", "keywords", "priority"].forEach(id => put(id, "—"));
       ["hosts", "importance", "checks"].forEach(id => $(id).replaceChildren());

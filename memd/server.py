@@ -10,9 +10,10 @@
   POST /ask {question,k?,stores?|scope?,host?,tags?} -> {answer,citations,...}  (same auth as /recall; memd.ask)
   POST /save  {title,...}  -> SaveResult                 (requires MEMD_TOKEN)
   POST /propose {title,...} -> {id, lint}               (same auth as /save; memd.inbox)
+  GET  /proposals?status=, /proposals/{id} -> the caller's own candidates  (read access to the store; memd.inbox)
   GET  /handoff?repo=      -> {handoff: {text,as_of,...}} (same auth as /propose; memd.handoff)
   POST /publish {slug,target_store,store?} -> receipt   (read on source + write on target; memd.share)
-  GET  /inbox, /inbox/{id}; POST /inbox/{id}/approve|reject  (account session; memd.inbox)
+  GET  /inbox, /inbox/{id}; POST /inbox/{id}/approve|reject  (review access to the store; memd.inbox)
   POST /reindex {profile?,pull?} -> {ok,notes,head,pulled}   (requires MEMD_TOKEN)
 """
 from __future__ import annotations
@@ -208,8 +209,9 @@ def _core_save(fact, profile="amber"):
 def _core_propose(fact, profile="amber", *, source="agent"):
     """Default inbox proposal used by the module-level app (memd.inbox)."""
     from memd import inbox
-    from memd.actor import get_actor
-    return inbox.propose(fact, profile, cfg=_cfg(profile), source=source, proposer=get_actor())
+    from memd.actor import caller
+    who = caller()
+    return inbox.propose(fact, profile, cfg=_cfg(profile), source=source, proposer=who.label, caller=who)
 
 
 def _core_save_with_cfg(fact, profile="amber", cfg=None):
@@ -979,7 +981,7 @@ def create_token_app() -> FastAPI:
 
         def one(store, query, k, **kw):
             return _core_recall(query, profile=store, k=k, **kw)
-        out = share.federated_recall(args, stores, one)
+        out = share.federated_recall(args, stores, one, budget_ms=share.deadline_ms(args.get("deadline_ms")))
         shaped = out["shaped"]
         context = shaped.pop("text")
         control.audit_read("recall.federated", ",".join(map(str, stores))[:200])
@@ -1122,10 +1124,11 @@ def create_token_app() -> FastAPI:
         profile = _resolve_profile(fact.pop("profile", None), "save")
         access.authorize(profile, write=True)
         from memd import inbox
-        if inbox.save_routes_to_inbox():
-            # MEMD_SAVE_MODE=inbox: an agent token's save waits for review.
+        if inbox.save_routes_to_inbox(profile):
+            # The store's review policy, or MEMD_SAVE_MODE=inbox: this save waits for review.
             try:
-                queued = inbox.queued_receipt(_core_propose(fact, profile=profile, source="save"))
+                queued = inbox.queued_receipt(_core_propose(fact, profile=profile, source="save"),
+                                              inbox.review_policy(profile))
             except ValueError as exc:
                 raise HTTPException(status_code=400, detail=str(exc)) from exc
             from fastapi.responses import JSONResponse
@@ -1186,6 +1189,29 @@ def create_token_app() -> FastAPI:
         except ValueError as exc:
             raise HTTPException(status_code=400, detail=str(exc)) from exc
 
+    @token_app.get("/proposals", dependencies=[Depends(require_token)])
+    def proposals_route(profile: str | None = None, status: str = "pending",
+                        offset: int = Query(default=0, ge=0), limit: int = Query(default=50, ge=1, le=200)):
+        """The candidates the caller itself filed and what became of them (memd.inbox).
+
+        Authorised as a read of the store, like /read. Only the proposing
+        credential's own candidates: never anyone else's, not even their count.
+        """
+        from memd import inbox
+        from memd.actor import caller
+        profile = _resolve_profile(profile)
+        return _inbox_call(lambda: {**inbox.own_proposals(_cfg(profile), profile, caller(), status=status,
+                                                          limit=limit, offset=offset),
+                                    "profile": profile})
+
+    @token_app.get("/proposals/{candidate_id}", dependencies=[Depends(require_token)])
+    def proposal_route(candidate_id: str, profile: str | None = None):
+        """One of the caller's own candidates, with its full text; anyone else's is a 404."""
+        from memd import inbox
+        from memd.actor import caller
+        profile = _resolve_profile(profile)
+        return _inbox_call(lambda: inbox.own_proposal(_cfg(profile), profile, caller(), candidate_id))
+
     @token_app.get("/handoff", dependencies=[Depends(require_token)])
     def handoff_route(repo: str = "", profile: str | None = None, max_age_days: int | None = None) -> dict:
         """The newest session handoff for a repository (memd.handoff); same auth as /propose.
@@ -1194,11 +1220,13 @@ def create_token_app() -> FastAPI:
         proposed it. Text only.
         """
         from memd import handoff
-        from memd.actor import get_actor
+        from memd.actor import caller
         profile = _resolve_profile(profile, "save")
         access.authorize(profile, write=True)
+        who = caller()
         try:
-            found = handoff.latest(_cfg(profile), profile, repo.strip().casefold(), proposer=get_actor(),
+            found = handoff.latest(_cfg(profile), profile, repo.strip().casefold(), proposer=who.label,
+                                   account=who.account, credential=who.credential,
                                    max_age=handoff.max_age_days(max_age_days))
         except ValueError as exc:
             raise HTTPException(status_code=400, detail=str(exc)) from exc
@@ -1222,16 +1250,16 @@ def create_token_app() -> FastAPI:
         from memd import inbox
         profile = _resolve_profile(profile, "save")
         try:
-            reviewer, is_token = inbox.reviewer_for(profile)
+            reviewer = inbox.reviewer_for(profile)
         except PermissionError as exc:
             raise HTTPException(status_code=403, detail=str(exc)) from exc
-        return profile, reviewer, is_token
+        return profile, reviewer
 
     @token_app.get("/inbox", dependencies=[Depends(require_token)])
     def inbox_list(profile: str | None = None, status: str = "pending",
                    offset: int = Query(default=0, ge=0), limit: int = Query(default=50, ge=1, le=200)):
         from memd import inbox
-        profile, _, _ = _inbox_reviewer(profile)
+        profile, _ = _inbox_reviewer(profile)
         return _inbox_call(lambda: {**inbox.list_candidates(_cfg(profile), profile, status=status,
                                                             limit=limit, offset=offset),
                                     "profile": profile})
@@ -1239,7 +1267,7 @@ def create_token_app() -> FastAPI:
     @token_app.get("/inbox/{candidate_id}", dependencies=[Depends(require_token)])
     def inbox_get(candidate_id: str, profile: str | None = None):
         from memd import inbox
-        profile, _, _ = _inbox_reviewer(profile)
+        profile, _ = _inbox_reviewer(profile)
         return _inbox_call(lambda: inbox.get(_cfg(profile), profile, candidate_id))
 
     @token_app.post("/inbox/{candidate_id}/approve", dependencies=[Depends(require_token)])
@@ -1248,10 +1276,10 @@ def create_token_app() -> FastAPI:
         payload = payload or {}
         if set(payload) - {"profile", "edits"}:
             raise HTTPException(status_code=400, detail="Send {edits?, profile?}")
-        profile, reviewer, is_token = _inbox_reviewer(payload.get("profile"))
+        profile, reviewer = _inbox_reviewer(payload.get("profile"))
         return _inbox_call(lambda: inbox.approve(
             _cfg(profile), profile, candidate_id, reviewer=reviewer, edits=payload.get("edits"),
-            reviewer_is_token=is_token, save_fn=_core_save_with_cfg))
+            save_fn=_core_save_with_cfg))
 
     @token_app.post("/inbox/{candidate_id}/reject", dependencies=[Depends(require_token)])
     def inbox_reject(candidate_id: str, payload: dict | None = None):
@@ -1259,10 +1287,10 @@ def create_token_app() -> FastAPI:
         payload = payload or {}
         if set(payload) - {"profile", "reason"}:
             raise HTTPException(status_code=400, detail="Send {reason?, profile?}")
-        profile, reviewer, is_token = _inbox_reviewer(payload.get("profile"))
+        profile, reviewer = _inbox_reviewer(payload.get("profile"))
         return _inbox_call(lambda: inbox.reject(
             _cfg(profile), profile, candidate_id, reviewer=reviewer,
-            reason=payload.get("reason") or "", reviewer_is_token=is_token))
+            reason=payload.get("reason") or ""))
 
     @token_app.post("/reindex", dependencies=[Depends(require_token)])
     def reindex_route(payload: dict | None = None) -> dict:
@@ -1295,7 +1323,7 @@ def create_token_app() -> FastAPI:
 
     @token_app.get("/ui/assets/{name}")
     def dashboard_asset(name: str):
-        if name not in {"app.js", "style.css", "icon.svg", "admin.js", "health.js", "entities.js"}:
+        if name not in {"app.js", "style.css", "icon.svg", "admin.js", "health.js", "entities.js", "inbox.js"}:
             raise HTTPException(status_code=404, detail="unknown asset")
         return FileResponse(web_dir / name, headers=web_headers)
 
@@ -1383,9 +1411,11 @@ ENDPOINTS
     POST /read                Read a note (bearer token required)
     POST /save                Save a note (bearer token required)
     POST /propose             Propose a note for review (bearer token required)
+    GET  /proposals           Your own proposals and what became of them (bearer token required)
+    GET  /proposals/ID        One of your own proposals, with its full text (bearer token required)
     GET  /handoff?repo=       Latest session handoff for a repository (bearer token required)
     POST /publish             Publish a note into another store (bearer token required)
-    GET  /inbox               Candidates waiting for review (signed-in account)
+    GET  /inbox               Candidates waiting for review (review access to the store)
     POST /reindex             Refresh the index (bearer token required)
     POST / or /mcp/           MCP over HTTP (bearer token required)
 
