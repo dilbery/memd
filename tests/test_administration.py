@@ -1,5 +1,7 @@
 import json
 from pathlib import Path
+import sqlite3
+import threading
 import time
 
 from fastapi.testclient import TestClient
@@ -288,6 +290,82 @@ def test_settings_publish_review_checkbox_round_trip(admin,monkeypatch):
     assert listed(client,"shared")["publish_review"] is True
 
 
+def test_settings_review_policy_round_trip(admin,monkeypatch):
+    from memd import inbox
+    client,_,_,_=admin
+    # The served store: open by default, and so far reviewed by this administrator alone.
+    assert (listed(client,"amber")["review_policy"],listed(client,"amber")["reviewers"])==("open",1)
+    r=client.put("/admin/stores/amber",json=store_form("amber","amber","existing",review_policy="four-eyes"))
+    assert r.status_code==200,r.text
+    assert (r.json()["store"]["review_policy"],r.json()["store"]["reviewers"])==("four-eyes",1)
+    assert listed(client,"amber")["review_policy"]=="four-eyes" and inbox.review_policy("amber")=="four-eyes"
+    # The session that saved it is told at once, wherever its stores are listed.
+    for path in ("/ui/me","/ui/stores"):
+        assert client.get(path).json()["stores"]==[{"id":"amber","name":"amber","permission":"write","review":True,"review_policy":"four-eyes"}]
+    # Saving other settings with the choice untouched keeps it.
+    assert client.put("/admin/stores/amber",json=store_form("amber","Amber notes","existing")).status_code==200
+    assert listed(client,"amber")["review_policy"]=="four-eyes"
+    # One of the three names exactly: anything else is a 400, for an existing store and a new one.
+    for bad in ("strict","Four-Eyes","four_eyes","FOUR-EYES","",None,True,1,["open"],{"policy":"open"}):
+        r=client.put("/admin/stores/amber",json=store_form("amber","amber","existing",review_policy=bad))
+        assert r.status_code==400 and "review_policy" in r.json()["detail"],(bad,r.text)
+        assert client.post("/admin/stores",json=store_form("bad","Bad","local",review_policy=bad)).status_code==400
+    assert listed(client,"amber")["review_policy"]=="four-eyes" and control.store("bad") is None
+    for policy in ("agents","open"):
+        assert client.put("/admin/stores/amber",json=store_form("amber","amber","existing",review_policy=policy)).status_code==200
+        assert listed(client,"amber")["review_policy"]==policy and inbox.review_policy("amber")==policy
+    # A new store created with a policy.
+    r=client.post("/admin/stores",json=store_form("team","Team","local",review_policy="agents"))
+    assert r.status_code==200,r.text
+    assert r.json()["store"]["review_policy"]=="agents" and listed(client,"team")["review_policy"]=="agents"
+    assert {s["id"]:s["review_policy"] for s in client.get("/ui/me").json()["stores"]}=={"amber":"open","team":"agents"}
+    # A store without the setting shows its environment default, and saving the
+    # form without touching the choice does not pin that default as a setting.
+    monkeypatch.setenv("MEMD_SHARED_REVIEW_POLICY","Four_Eyes")
+    assert client.post("/admin/stores",json=store_form("shared","Shared","local")).status_code==200
+    assert listed(client,"shared")["review_policy"]=="four-eyes"
+    assert client.put("/admin/stores/shared",json=store_form("shared","Shared team","local")).status_code==200
+    assert "review_policy" not in control.store("shared")["config"]
+    monkeypatch.delenv("MEMD_SHARED_REVIEW_POLICY")
+    assert listed(client,"shared")["review_policy"]=="open"
+
+
+def test_validate_config_keeps_a_review_policy_only_when_it_is_one_of_the_three():
+    for policy in ("open","agents","four-eyes"):
+        assert sources.validate_config("local",{"review_policy":policy})["review_policy"]==policy
+    assert "review_policy" not in sources.validate_config("local",{})
+    # Left out of an update, the stored choice stays.
+    assert sources.validate_config("local",{"branch":"main"},{"review_policy":"agents"})["review_policy"]=="agents"
+    for bad in ("strict","Four-Eyes","four_eyes"," open","",None,False,0,["agents"],{"four-eyes":True}):
+        with pytest.raises(ValueError,match="review_policy must be open, agents or four-eyes"):
+            sources.validate_config("local",{"review_policy":bad},{"review_policy":"agents"})
+
+
+def test_overview_counts_the_accounts_that_may_review_each_store(admin):
+    client,_,_,_=admin
+    assert client.post("/admin/stores",json={"id":"team","name":"Team","kind":"local"}).status_code==200
+    def reviewers():
+        return {s["id"]:s["reviewers"] for s in client.get("/admin/overview").json()["stores"]}
+    def account(name,grants,**fields):
+        made=client.post("/admin/users",json={"username":name,**fields}).json()
+        assert client.put(f'/admin/users/{made["id"]}/grants',json={"grants":grants}).status_code==200
+        return made["id"]
+    assert reviewers()=={"amber":1,"team":1}     # the administrator reviews every store
+    # Neither read nor write is review.
+    account("reader",{"amber":"read","team":"read"})
+    account("writer",{"amber":{"permission":"write","review":False}})
+    assert reviewers()=={"amber":1,"team":1}
+    cobalt=account("cobalt",{"amber":{"permission":"read","review":True},"team":"write"})
+    assert reviewers()=={"amber":2,"team":2}
+    # A second administrator counts once in every store, with a grant of their own or without.
+    deputy=account("deputy",{"team":"write"},role="admin")
+    assert reviewers()=={"amber":3,"team":3}
+    # A disabled account reviews nothing, and a removed grant is no longer counted.
+    assert client.patch(f"/admin/users/{deputy}",json={"disabled":True}).status_code==200
+    assert client.put(f"/admin/users/{cobalt}/grants",json={"grants":{"amber":"read","team":"write"}}).status_code==200
+    assert reviewers()=={"amber":1,"team":2}
+
+
 def issue_form(uid,store,scope,extra):
     """The payload the Administration token form sends (memd/web/admin.js)."""
     return {"label":"shared-agent","user_id":uid,"store_id":store,"scope":scope,
@@ -353,3 +431,181 @@ def test_dashboard_renders_both_settings_as_text(admin):
     assert "extra_stores" in script and "publish_review" in script
     for unsafe in ("innerHTML","outerHTML","insertAdjacentHTML","document.write"):
         assert unsafe not in script
+
+
+# ---------------------------------------------------------------- review columns on upgrade
+
+BEFORE_REVIEW="""
+CREATE TABLE users(id TEXT PRIMARY KEY, username TEXT NOT NULL UNIQUE, password TEXT NOT NULL,
+    role TEXT NOT NULL, disabled INTEGER NOT NULL DEFAULT 0, created REAL NOT NULL);
+CREATE TABLE stores(id TEXT PRIMARY KEY, name TEXT NOT NULL, kind TEXT NOT NULL,
+    config TEXT NOT NULL, created REAL NOT NULL);
+CREATE TABLE grants(user_id TEXT REFERENCES users(id), store_id TEXT REFERENCES stores(id),
+    permission TEXT NOT NULL, PRIMARY KEY(user_id,store_id));
+CREATE TABLE tokens(id TEXT PRIMARY KEY, digest TEXT NOT NULL UNIQUE, label TEXT NOT NULL,
+    user_id TEXT REFERENCES users(id), store_id TEXT NOT NULL,
+    scope TEXT NOT NULL, masked TEXT NOT NULL, legacy INTEGER NOT NULL DEFAULT 0,
+    created REAL NOT NULL, last_used REAL, expires REAL, revoked REAL);
+INSERT INTO users VALUES('u-writer','writer','x','member',0,1.0),('u-reader','reader','x','member',0,1.0);
+INSERT INTO stores VALUES('amber','amber','local','{}',1.0),('team','team','local','{}',1.0);
+INSERT INTO grants VALUES('u-writer','amber','write'),('u-writer','team','read'),('u-reader','amber','read');
+INSERT INTO tokens(id,digest,label,user_id,store_id,scope,masked,created)
+    VALUES('t-1','d-1','laptop','u-writer','amber','write','abcd',1.0);
+"""
+UPGRADED_GRANTS={("u-writer","amber"):("write",1),("u-writer","team"):("read",0),("u-reader","amber"):("read",0)}
+
+
+@pytest.fixture(params=["without-extra","with-extra"])
+def earlier(request,tmp_path,monkeypatch):
+    """An administration database as an earlier build left it: no review on grants or tokens."""
+    path=tmp_path/"control"/"admin.db"
+    path.parent.mkdir()
+    monkeypatch.setenv("MEMD_ADMIN_DB",str(path))
+    connection=sqlite3.connect(path)
+    connection.executescript(BEFORE_REVIEW)
+    if request.param=="with-extra":
+        connection.execute("ALTER TABLE tokens ADD COLUMN extra TEXT NOT NULL DEFAULT '{}'")
+        connection.execute("""UPDATE tokens SET extra='{"team": "read"}'""")
+        connection.commit()
+    connection.close()
+    return path
+
+
+def shape(path):
+    """(grants columns, tokens columns, grants rows, tokens rows, schema version) of a database."""
+    connection=sqlite3.connect(path)
+    try:
+        grants=[r[1] for r in connection.execute("PRAGMA table_info(grants)")]
+        tokens=[r[1] for r in connection.execute("PRAGMA table_info(tokens)")]
+        return (grants,tokens,sorted(connection.execute("SELECT * FROM grants")),
+                sorted(connection.execute("SELECT * FROM tokens"),key=repr),
+                connection.execute("PRAGMA schema_version").fetchone()[0])
+    finally:
+        connection.close()
+
+
+def reviews(path):
+    connection=sqlite3.connect(path)
+    try:
+        return {(u,s):(p,r) for u,s,p,r in connection.execute("SELECT user_id,store_id,permission,review FROM grants")}
+    finally:
+        connection.close()
+
+
+def test_upgrade_adds_review_and_every_write_grant_keeps_it(earlier):
+    had_extra="extra" in shape(earlier)[1]
+    control.initialize()
+    grants,tokens,_,_,_=shape(earlier)
+    assert grants==["user_id","store_id","permission","review"]
+    assert {"review","extra"}<=set(tokens) and len(tokens)==len(set(tokens))
+    assert reviews(earlier)==UPGRADED_GRANTS
+    # No token reviews until one is issued to; what a token already reached is kept.
+    [record]=control.token_records()
+    assert record["review"] is False and record["extra"]==({"team":"read"} if had_extra else {})
+
+
+def test_a_second_run_changes_nothing_and_a_removed_review_stays_removed(earlier):
+    control.initialize()
+    with control.db() as c:
+        c.execute("UPDATE grants SET review=0 WHERE user_id='u-writer' AND store_id='amber'")
+        c.execute("INSERT INTO grants(user_id,store_id,permission,review) VALUES('u-reader','team','write',0)")
+    before=shape(earlier)
+    control.initialize()
+    control.initialize()
+    assert shape(earlier)==before
+    assert reviews(earlier)[("u-writer","amber")]==("write",0) and reviews(earlier)[("u-reader","team")]==("write",0)
+
+
+@pytest.mark.parametrize("failing",["UPDATE grants SET review","ALTER TABLE tokens ADD COLUMN review","COMMIT"])
+def test_a_failed_upgrade_leaves_no_column_without_its_backfill(earlier,monkeypatch,failing):
+    grants,tokens,grant_rows,token_rows,_=shape(earlier)
+    connect=sqlite3.connect
+
+    class Failing(sqlite3.Connection):
+        def execute(self,sql,*args):
+            if sql.startswith(failing):
+                raise sqlite3.OperationalError("disk I/O error")
+            return super().execute(sql,*args)
+    with monkeypatch.context() as patched:
+        patched.setattr(sqlite3,"connect",lambda *args,**kwargs: connect(*args,**kwargs,factory=Failing))
+        with pytest.raises(sqlite3.OperationalError,match="disk I/O error"):
+            control.initialize()
+    # Nothing of the upgrade is left behind: a column without its backfill would
+    # pass the next run's check and leave every writer unable to review for good.
+    assert shape(earlier)[:4]==(grants,tokens,grant_rows,token_rows)
+    control.initialize()
+    assert reviews(earlier)==UPGRADED_GRANTS
+    assert {"review","extra"}<=set(shape(earlier)[1])
+
+
+def test_an_instance_that_starts_during_anothers_upgrade_waits_and_both_succeed(earlier,monkeypatch):
+    connect=sqlite3.connect
+    inside,finish,errors=threading.Event(),threading.Event(),[]
+
+    class Held(sqlite3.Connection):
+        def execute(self,sql,*args):
+            cursor=super().execute(sql,*args)
+            if sql.startswith("UPDATE grants SET review") and not inside.is_set():
+                inside.set()                 # the column is added, nothing is committed
+                if not finish.wait(20):
+                    raise AssertionError("the first upgrade was never released")
+            return cursor
+
+    def start():
+        try:
+            control.initialize()
+        except BaseException as exc:
+            errors.append(exc)
+    with monkeypatch.context() as patched:
+        patched.setattr(sqlite3,"connect",lambda *args,**kwargs: connect(*args,**kwargs,factory=Held))
+        first=threading.Thread(target=start)
+        first.start()
+        assert inside.wait(20)
+        second=threading.Thread(target=start)
+        second.start()
+        second.join(0.5)
+        waiting=second.is_alive() and not errors
+        finish.set()
+        first.join(30)
+        second.join(30)
+    assert waiting and errors==[] and not first.is_alive() and not second.is_alive()
+    grants,tokens,_,_,_=shape(earlier)
+    assert grants==["user_id","store_id","permission","review"] and len(tokens)==len(set(tokens))
+    assert reviews(earlier)==UPGRADED_GRANTS
+
+
+def start_together(count=6):
+    """Initialise the configured database from `count` instances at once; their errors."""
+    gate,errors=threading.Barrier(count),[]
+
+    def start():
+        try:
+            gate.wait(20)
+            control.initialize()
+        except BaseException as exc:
+            errors.append(exc)
+    threads=[threading.Thread(target=start) for _ in range(count)]
+    for thread in threads:
+        thread.start()
+    for thread in threads:
+        thread.join(60)
+    assert not any(thread.is_alive() for thread in threads)
+    return errors
+
+
+def test_instances_that_start_together_on_an_earlier_database_all_succeed(earlier):
+    assert start_together()==[]
+    grants,tokens,_,_,_=shape(earlier)
+    assert grants==["user_id","store_id","permission","review"]
+    assert {"review","extra"}<=set(tokens) and len(tokens)==len(set(tokens))
+    assert reviews(earlier)==UPGRADED_GRANTS
+
+
+def test_instances_that_start_together_on_a_new_database_all_succeed(tmp_path,monkeypatch):
+    path=tmp_path/"control"/"admin.db"
+    monkeypatch.setenv("MEMD_ADMIN_DB",str(path))
+    assert start_together()==[]
+    grants,tokens,_,_,_=shape(path)
+    assert grants==["user_id","store_id","permission","review"]
+    assert {"review","extra"}<=set(tokens) and len(tokens)==len(set(tokens))
+    assert path.stat().st_mode & 0o777==0o600

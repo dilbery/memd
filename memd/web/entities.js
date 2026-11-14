@@ -190,7 +190,7 @@
         li.append(el("span", "small muted", [c.source, c.created ? `proposed ${c.created.slice(0, 10)}` : ""].filter(Boolean).join(" · "))); ul.append(li);
       }
     }, false, !inbox.can_review && inbox.pending
-      ? `${plural(inbox.pending, "candidate waits", "candidates wait")} for review. Sign in with write access to this store to see them.`
+      ? `${plural(inbox.pending, "candidate waits", "candidates wait")} for review. Sign in with review access to this store to see them.`
       : "Nothing waiting."));
     $("entity-sections").replaceChildren(...panels);
   }

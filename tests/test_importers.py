@@ -138,8 +138,8 @@ def test_chatgpt_zip_import_redacts_tags_and_never_duplicates_on_rerun(store, tm
 
     # Decide two of them; a re-run files nothing, whatever their status.
     ids = [i["id"] for i in report["filed"]]
-    inbox.approve(store, "amber", ids[0], reviewer="owner")
-    inbox.reject(store, "amber", ids[1], reviewer="owner", reason="no")
+    inbox.approve(store, "amber", ids[0], reviewer=inbox.operator_reviewer("owner"))
+    inbox.reject(store, "amber", ids[1], reviewer=inbox.operator_reviewer("owner"), reason="no")
     code, again, _ = _json_run(capsys, "chatgpt", str(export))
     assert code == 0 and again["filed"] == []
     assert {s["duplicate_of"] for s in again["skipped"]} == {"already imported"}

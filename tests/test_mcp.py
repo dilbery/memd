@@ -38,7 +38,7 @@ class _FakeSaveResult:
 def test_list_tools_exposes_recall_and_save():
     tools = asyncio.run(mcp.list_tools())
     names = sorted(t.name for t in tools)
-    assert names == ["ask", "propose", "publish", "read", "recall", "save", "timeline"], names
+    assert names == ["ask", "proposals", "propose", "publish", "read", "recall", "save", "timeline"], names
     # The canonical names must still be advertised and described first.
     recall = next(t for t in tools if t.name == "recall")
     assert "query" in recall.input_schema["properties"]

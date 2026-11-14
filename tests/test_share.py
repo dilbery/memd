@@ -5,16 +5,20 @@ layer (accounts, grants, scoped tokens), model backends replaced by stubs, the
 socket guard blocks everything else. Every refusal also asserts that nothing
 was written and nothing from the refused store came back.
 """
+import asyncio
+import contextvars
 import json
 import subprocess
+import threading
 import time
 
 import pytest
 from fastapi.testclient import TestClient
 
+import memd.mcp as mcp_mod
 import memd.recall as recall_mod
 import memd.save as save_mod
-from memd import control, server, share, sources
+from memd import access, actor, control, facts, server, share, sources
 from memd.config import Config
 from memd.refresh import ensure_lexical
 from memd.store import list_notes, read_note
@@ -526,3 +530,479 @@ def test_federated_recall_is_usage_logged_per_store_under_one_id(team, monkeypat
     path = usage.usage_path(usage.index_path(_store_cfg("team"), "team"))
     with sqlite3.connect(path) as db:
         assert db.execute("SELECT recall_id FROM reads WHERE slug='team-backup-rota'").fetchone()[0] == rid
+
+
+# --------------------------------------------------------------------------- federated recall: deadline, facts, skipped stores
+
+SURFACES = ("rest", "mcp")
+PROXY_NOW = "where does the nginx proxy run now?"
+
+
+def _federated(agent, surface, body):
+    """One federated recall over REST or MCP: (text, stores, stores_skipped, rendering)."""
+    if surface == "rest":
+        r = agent.post("/recall", json=body)
+        assert r.status_code == 200, r.text
+        out = r.json()
+        return out["context"], out["stores"], out["stores_skipped"], out["rendering"]
+    result = _mcp(agent, "recall", body)
+    assert result["isError"] is False, result
+    out = result["structuredContent"]
+    return out["text"], out["stores"], out["stores_skipped"], out
+
+
+def _patch_recall(monkeypatch, behave):
+    """Call `behave(store)` before each store's recall, REST and MCP; a list it returns is the result."""
+    def wrap(real):
+        def recall(query, profile="amber", k=8, **kw):
+            early = behave(profile)
+            return early if early is not None else real(query, profile=profile, k=k, **kw)
+        return recall
+    monkeypatch.setattr(server, "_core_recall", wrap(server._core_recall))
+    monkeypatch.setattr(mcp_mod, "_core_recall", wrap(mcp_mod._core_recall))
+
+
+def _hold(monkeypatch, store="team"):
+    """Recall of `store` hangs until the returned event is set, then finds nothing."""
+    release = threading.Event()
+
+    def behave(profile):
+        if profile == store:
+            release.wait(10)
+            return []
+    _patch_recall(monkeypatch, behave)
+    return release
+
+
+def test_deadline_ms_argument_and_budget(monkeypatch):
+    from memd.config import DEFAULT_EMBED_DEADLINE_MS, DEFAULT_RERANK_DEADLINE_MS
+    from memd.normalize import normalize_recall_args
+    for junk in ("soon", "", None, 0, -1, "0", "-5", 0.0, float("nan"), float("inf"), "nan", "inf", "-inf",
+                 "1e999", True, False, [], [250], {}):
+        assert "deadline_ms" not in normalize_recall_args({"query": "q", "deadline_ms": junk}), repr(junk)
+    for value, want in ((250, 250), ("250", 250), (" 250 ", 250), (250.9, 250), ("1e3", 1000), (0.5, 100),
+                        (7, 100), (10 ** 12, 10 ** 12)):
+        assert normalize_recall_args({"query": "q", "deadline_ms": value})["deadline_ms"] == want
+    assert set(normalize_recall_args({"query": "q"})) == {"query", "k"}
+
+    monkeypatch.setenv("MEMD_FEDERATED_DEADLINE_MS", "2000")
+    assert share.deadline_ms() == share.deadline_ms(None) == 2000
+    assert [share.deadline_ms(v) for v in (1, 100, 750, 2000, 2001, 10 ** 12)] == \
+        [100, 100, 750, 2000, 2000, 2000]
+    monkeypatch.delenv("MEMD_FEDERATED_DEADLINE_MS")
+    default = DEFAULT_EMBED_DEADLINE_MS + DEFAULT_RERANK_DEADLINE_MS + share.FEDERATION_SLACK_MS
+    assert share.deadline_ms(10 ** 9) == share.deadline_ms() == default
+
+    props = {t.name: t.input_schema["properties"] for t in asyncio.run(mcp_mod.list_tools())}
+    assert set(props["recall"]["deadline_ms"]["type"]) == {"number", "string"}
+    assert props["recall"]["deadline_ms"]["description"]
+    assert "deadline_ms" not in props["ask"]
+
+
+def test_federated_deadline_ms_can_only_shorten_the_server_budget(team, monkeypatch):
+    agent = _agent(team, {"team": "write"})
+    _seed_team(agent)
+    ensure_lexical(_store_cfg("team"))
+    body = {"query": "archive backup", "stores": ["amber", "team"]}
+    for surface in SURFACES:
+        plain = _federated(agent, surface, body)
+        assert plain[1] == ["amber", "team"] and plain[2] == []
+        assert _federated(agent, surface, {**body, "deadline_ms": 600000}) == plain
+    # A store that hangs is still cut off at the server's own budget.
+    monkeypatch.setenv("MEMD_FEDERATED_DEADLINE_MS", "400")
+    release = _hold(monkeypatch)
+    try:
+        for surface in SURFACES:
+            start = time.monotonic()
+            _, stores, skipped, _ = _federated(agent, surface, {**body, "deadline_ms": 600000})
+            assert time.monotonic() - start < 5
+            assert stores == ["amber"] and skipped == [{"store": "team", "reason": "deadline"}]
+    finally:
+        release.set()
+
+
+def test_federated_small_deadline_ms_skips_a_slow_store_and_names_it(team, monkeypatch):
+    agent = _agent(team, {"team": "write"})
+    monkeypatch.setenv("MEMD_FEDERATED_DEADLINE_MS", "20000")
+    # The store's hung recalls pile up across these requests, charged to this caller; past the
+    # limit it would be reported busy rather than cut off (test_a_deadline_the_caller_shortened_...).
+    monkeypatch.setattr(share, "FEDERATION_STUCK_PER_CALLER", 64)
+    release = _hold(monkeypatch)
+    line = "[Stores not searched: team (deadline).]"
+    body = {"query": "archive backup", "stores": ["amber", "team"], "deadline_ms": 300}
+    try:
+        for surface in SURFACES:
+            start = time.monotonic()
+            text, stores, skipped, rendering = _federated(agent, surface, body)
+            assert time.monotonic() - start < 10        # far inside the 20 s server budget
+            assert stores == ["amber"] and skipped == [{"store": "team", "reason": "deadline"}]
+            assert "### [amber] archive-backup-window" in text and text.endswith("\n\n" + line)
+            assert text.count("Stores not searched") == 1
+            assert {e["store"] for e in rendering["excerpts"]} == {"amber"}
+            # The line is inside max_chars, whatever the notes would have used.
+            for max_chars in (256, 600):
+                tight = _federated(agent, surface, {**body, "max_chars": max_chars})[0]
+                assert tight.endswith(line) and len(tight) <= max_chars, (surface, max_chars, tight)
+    finally:
+        release.set()
+
+
+def test_deadline_ms_is_ignored_by_a_single_store_recall(team, monkeypatch):
+    agent = _agent(team, {"team": "write"})
+    body = {"query": "archive backup"}
+    rest = agent.post("/recall", json=body).json()
+    tool = _mcp(agent, "recall", body)["structuredContent"]
+    assert rest["notes"] and "stores" not in rest and "stores" not in tool
+    # Slower than the deadline it is sent: nothing is cut off and nothing is added.
+    _patch_recall(monkeypatch, lambda profile: time.sleep(0.25))
+    for value in (100, "soon"):
+        assert agent.post("/recall", json={**body, "deadline_ms": value}).json() == rest
+        assert _mcp(agent, "recall", {**body, "deadline_ms": value})["structuredContent"] == tool
+
+
+def test_federated_recall_ignores_a_deadline_ms_that_is_not_a_positive_number(team, monkeypatch):
+    agent = _agent(team, {"team": "write"})
+
+    def behave(profile):
+        if profile == "team":
+            time.sleep(0.2)     # longer than the 100 ms floor a clamped value would give
+            return []
+    _patch_recall(monkeypatch, behave)
+    body = {"query": "archive backup", "stores": ["amber", "team"]}
+    for surface in SURFACES:
+        plain = _federated(agent, surface, body)
+        assert plain[1] == ["amber", "team"] and "Stores not searched" not in plain[0]
+        for value in ("soon", 0, -250):
+            assert _federated(agent, surface, {**body, "deadline_ms": value}) == plain, (surface, value)
+        # The same store is skipped as soon as the value is a usable number.
+        assert _federated(agent, surface, {**body, "deadline_ms": 1})[1] == ["amber"]
+
+
+def _seed_proxy_facts(agent):
+    """One current fact about the same subject in each store, with a different answer."""
+    for store, host in (("amber", "gpuhost"), ("team", "vmhost")):
+        r = agent.post("/save", json={"profile": store, "title": f"Proxy host for {store}",
+                                      "body": f"The nginx proxy runs on {host} since 2026-03-01."})
+        assert r.status_code == 200, r.text
+        facts.run(_store_cfg(store), use_llm=False)
+
+
+def _proxy_fact(store, host):
+    return (f"### [{store}] Current facts (timeline)\n"
+            f"- The nginx proxy | runs on | {host} (since 2026-03-01; proxy-host-for-{store})")
+
+
+def test_federated_recall_appends_the_first_stores_current_facts(team, monkeypatch):
+    agent = _agent(team, {"team": "write"})
+    _seed_proxy_facts(agent)
+    mine, theirs = _proxy_fact("amber", "gpuhost"), _proxy_fact("team", "vmhost")
+    for surface in SURFACES:
+        text, _, _, rendering = _federated(agent, surface, {"query": "where does the nginx proxy run",
+                                                            "stores": ["amber", "team"]})
+        assert "Current facts" not in text and "current_facts" not in rendering
+
+        now = {"query": PROXY_NOW, "stores": ["amber", "team"]}
+        text, stores, _, rendering = _federated(agent, surface, now)
+        assert stores == ["amber", "team"] and rendering["current_facts"] == 1
+        assert text.endswith("\n\n" + mine) and text.count("Current facts") == 1
+        assert "[team] proxy-host-for-team" in text     # the other store is searched; its facts are not shown
+
+        text = _federated(agent, surface, {**now, "stores": ["team", "amber"]})[0]
+        assert text.endswith("\n\n" + theirs) and text.count("Current facts") == 1
+        assert _federated(agent, surface, {"query": PROXY_NOW, "scope": "all"})[0].endswith("\n\n" + mine)
+        # A block that does not fit is left out.
+        tight, _, _, rendering = _federated(agent, surface, {**now, "max_chars": 256})
+        assert "Current facts" not in tight and "current_facts" not in rendering and len(tight) <= 256
+
+    # The single-store block is unlabelled, as before.
+    single = agent.post("/recall", json={"query": PROXY_NOW}).json()["context"]
+    assert single.endswith("\n\n" + mine.replace("[amber] ", ""))
+
+    # A failing facts block never fails the recall.
+    def boom(*a, **kw):
+        raise RuntimeError("facts index unreadable")
+    monkeypatch.setattr(facts, "append_current_facts", boom)
+    for surface in SURFACES:
+        text, stores, _, _ = _federated(agent, surface, {"query": PROXY_NOW, "stores": ["amber", "team"]})
+        assert stores == ["amber", "team"] and "[amber] proxy-host-for-amber" in text
+        assert "Current facts" not in text
+
+
+def test_federated_recall_names_failed_stores_and_skips_the_facts_of_a_skipped_store(team, monkeypatch):
+    agent = _agent(team, {"team": "write"})
+    _seed_proxy_facts(agent)
+    failing = {"team": PermissionError("refused for a private reason")}
+
+    def behave(profile):
+        if profile in failing:
+            raise failing[profile]
+    _patch_recall(monkeypatch, behave)
+    now = {"query": PROXY_NOW, "stores": ["amber", "team"]}
+    for surface in SURFACES:
+        text, stores, skipped, _ = _federated(agent, surface, now)
+        assert stores == ["amber"] and skipped == [{"store": "team", "reason": "PermissionError"}]
+        # The facts block stays; the line about skipped stores closes the context.
+        assert text.endswith(_proxy_fact("amber", "gpuhost") + "\n\n[Stores not searched: team (PermissionError).]")
+        assert "private reason" not in text
+
+    # The first store is the one that failed: its facts are not shown either.
+    failing.clear()
+    failing["amber"] = RuntimeError("boom")
+    for surface in SURFACES:
+        text, stores, skipped, _ = _federated(agent, surface, now)
+        assert stores == ["team"] and skipped == [{"store": "amber", "reason": "RuntimeError"}]
+        assert "Current facts" not in text and "[team] proxy-host-for-team" in text
+        assert text.endswith("\n\n[Stores not searched: amber (RuntimeError).]")
+
+    # Every store skipped: the line alone.
+    failing["team"] = OSError("gone")
+    for surface in SURFACES:
+        text, stores, skipped, rendering = _federated(agent, surface, {**now, "max_chars": 256})
+        assert text == "[Stores not searched: amber (RuntimeError), team (OSError).]"
+        assert stores == [] and [s["store"] for s in skipped] == ["amber", "team"]
+        assert rendering["excerpts"] == []
+
+
+def _many(store, query, k, **kw):
+    if store.startswith("down"):
+        raise ConnectionError("unreachable")
+    return [{"slug": f"{store}-note-{i}", "matched": True, "body": f"backup window {i} " + "detail " * 60}
+            for i in range(6)] + [{"slug": f"{store}-core", "matched": False, "body": "core", "importance": 5}]
+
+
+def test_federated_recall_unchanged_without_skips_or_a_present_state_query():
+    from memd.render import render_result
+    for extra in ({}, {"max_chars": 700}, {"max_chars": 256}, {"core_limit": 0}, {"include_core": False}):
+        args = {"query": "backup window", "k": 4, **extra}
+        out = share.federated_recall(args, ["a", "b"], _many, budget_ms=5000)
+        assert out["stores"] == ["a", "b"] and out["stores_skipped"] == []
+        assert out["shaped"] == render_result(
+            out["notes"], top_n=4, max_chars=extra.get("max_chars", 14000), query="backup window",
+            core_limit=extra.get("core_limit"), include_core=extra.get("include_core", True))
+
+
+def test_federated_recall_skipped_line_always_fits_max_chars():
+    line = "[Stores not searched: down-1 (ConnectionError), down-2 (ConnectionError).]"
+    for max_chars in (256, 257, 300, 330, 331, 332, 400, 700, 2000, 14000):
+        out = share.federated_recall({"query": "backup window", "k": 6, "max_chars": max_chars},
+                                     ["a", "down-1", "b", "down-2"], _many, budget_ms=5000)
+        text = out["shaped"]["text"]
+        assert len(text) <= max_chars and text.endswith(line), (max_chars, len(text))
+        assert out["stores"] == ["a", "b"]
+        # What the rendering reports as shown is what the text holds.
+        assert all(f"### [{e['store']}] {e['slug']}" in text for e in out["shaped"]["excerpts"])
+    assert "### [a] a-note-0" in text and "## Recalled memory (memd)" in text
+
+    # A line longer than the whole budget is cut; the budget is never exceeded.
+    down = [f"down-{i:02d}-{'x' * 40}" for i in range(12)]
+    out = share.federated_recall({"query": "backup window", "k": 6, "max_chars": 256}, down, _many,
+                                 budget_ms=5000)
+    text = out["shaped"]["text"]
+    assert len(text) == 256 and text.startswith("[Stores not searched: down-00-") and out["stores"] == []
+
+
+def test_federated_facts_block_and_skipped_line_share_max_chars(team):
+    _seed_proxy_facts(_agent(team, {"team": "write"}))
+    block = _proxy_fact("amber", "gpuhost")
+    line = "[Stores not searched: down-1 (ConnectionError).]"
+    seen = set()
+    for max_chars in range(256, 560):
+        out = share.federated_recall({"query": PROXY_NOW, "k": 6, "max_chars": max_chars},
+                                     ["amber", "down-1"], _many, budget_ms=5000)
+        text, shown = out["shaped"]["text"], "current_facts" in out["shaped"]
+        assert len(text) <= max_chars and text.endswith(line), max_chars
+        # The block is whole or absent: the line that follows it never costs it its tail.
+        assert text.endswith(f"{block}\n\n{line}") if shown else "Current facts" not in text, max_chars
+        seen.add((shown, len(text) == max_chars))
+    # Left out when it does not fit, and admitted up to the last character of the budget.
+    assert (False, False) in seen and (True, True) in seen
+
+
+def test_federated_facts_block_is_never_read_from_an_ungranted_store(team):
+    agent = _agent(team, {"team": "write"})
+    _seed_proxy_facts(agent)
+    # `other` states a current fact about the same subject; the member has no grant on it.
+    keeper = _client(team, _issue(team["admin"], _admin_id(), "other", "write"))
+    r = keeper.post("/save", json={"title": "Proxy host for other",
+                                   "body": "The nginx proxy runs on vaulthost since 2026-03-01."})
+    assert r.status_code == 200, r.text
+    facts.run(_store_cfg("other"), use_llm=False)
+    granted = team["admin"].post("/recall", json={"query": PROXY_NOW, "stores": ["other", "amber"]}).json()
+    assert granted["context"].endswith("\n\n" + _proxy_fact("other", "vaulthost"))
+
+    for stores in (["other", "amber"], ["other"]):
+        r = agent.post("/recall", json={"query": PROXY_NOW, "stores": stores})
+        assert r.status_code == 403 and "vaulthost" not in r.text and "Current facts" not in r.text
+        result = _mcp(agent, "recall", {"query": PROXY_NOW, "stores": stores})
+        assert result["isError"] is True
+        assert "vaulthost" not in json.dumps(result) and "Current facts" not in json.dumps(result)
+    for surface in SURFACES:
+        text, stores, _, _ = _federated(agent, surface, {"query": PROXY_NOW, "scope": "all"})
+        assert stores == ["amber", "team"] and "vaulthost" not in text
+        assert text.endswith("\n\n" + _proxy_fact("amber", "gpuhost"))
+
+
+@pytest.fixture(autouse=True)
+def _no_stuck_recalls():
+    """Each test starts with no store counted as stuck; an earlier test's released recalls may still be ending."""
+    share._federation_stuck.clear()
+    yield
+    share._federation_stuck.clear()
+
+
+def _until(predicate, seconds=5.0):
+    end = time.monotonic() + seconds
+    while not predicate():
+        assert time.monotonic() < end, "timed out"
+        time.sleep(0.01)
+
+
+def test_a_hung_store_is_reported_busy_and_costs_a_bounded_number_of_threads(monkeypatch):
+    monkeypatch.setattr(share, "FEDERATION_STUCK_PER_STORE", 2)
+    # The server's own deadline runs out, so what is given up counts against the store, for everyone.
+    monkeypatch.setenv("MEMD_FEDERATED_DEADLINE_MS", "150")
+    release = threading.Event()
+    started = []
+
+    def one(store):
+        if store == "slow":
+            started.append(store)
+            release.wait(10)
+            return []
+        return [{"slug": f"{store}-0", "matched": True, "body": "b"}]
+
+    def threads():
+        return sum(t.name == "memd-federated" for t in threading.enumerate())
+    try:
+        for n in range(5):
+            notes, skipped = share.federate(["slow", "fast"], one, k=4)
+            # The healthy store is served every time; the hung one is cut off, then busy.
+            assert [note["slug"] for note in notes] == ["fast-0"]
+            assert skipped == [{"store": "slow", "reason": "deadline" if n < 2 else "busy"}], n
+        assert started == ["slow", "slow"] and share._federation_stuck == {("store", "slow"): 2}
+        _until(lambda: threads() == 2)      # the fast recalls' threads have ended; the hung two remain
+        # The same caller, asking for a healthy store alone, is not held up.
+        start = time.monotonic()
+        notes, skipped = share.federate(["fast"], one, k=4, budget_ms=3000)
+        assert skipped == [] and time.monotonic() - start < 1
+    finally:
+        release.set()
+    # Once the hung recalls end, the store is recalled again.
+    _until(lambda: share._federation_stuck == {})
+    notes, skipped = share.federate(["slow", "fast"], one, k=4, budget_ms=3000)
+    assert skipped == [] and started == ["slow"] * 3
+
+
+def test_a_deadline_the_caller_shortened_makes_a_store_busy_only_for_that_caller(monkeypatch):
+    monkeypatch.setenv("MEMD_FEDERATED_DEADLINE_MS", "20000")
+    release = threading.Event()
+    started = []
+
+    def one(store):
+        if store == "slow":
+            started.append(actor.get_actor())
+            release.wait(10)
+            return []
+        return [{"slug": f"{store}-0", "matched": True, "body": "b"}]
+
+    def as_caller(label, budget_ms=150):
+        def go():
+            actor.set_actor(label)
+            return share.federate(["slow", "fast"], one, k=4, budget_ms=budget_ms)
+        return contextvars.copy_context().run(go)
+    try:
+        for n in range(3):
+            notes, skipped = as_caller("looper")
+            assert [note["slug"] for note in notes] == ["fast-0"]
+            assert skipped == [{"store": "slow", "reason": "deadline" if n < 2 else "busy"}], n
+        # Given up at a deadline it chose: charged to that caller, not to the store.
+        assert share._federation_stuck == {("caller", ("label", "looper"), "slow"): 2, ("shortened", "slow"): 2}
+        # Another caller still recalls the store.
+        notes, skipped = as_caller("someone-else")
+        assert skipped == [{"store": "slow", "reason": "deadline"}]
+        assert started == ["looper", "looper", "someone-else"]
+    finally:
+        release.set()
+    _until(lambda: share._federation_stuck == {})
+
+
+def test_however_many_callers_shorten_the_deadline_the_threads_they_leave_stay_bounded(monkeypatch):
+    monkeypatch.setenv("MEMD_FEDERATED_DEADLINE_MS", "20000")
+    monkeypatch.setattr(share, "FEDERATION_STUCK_SHORTENED", 3)
+    release = threading.Event()
+    started = []
+
+    def one(store):
+        started.append(actor.get_actor())
+        release.wait(10)
+        return []
+
+    def as_caller(label):
+        def go():
+            actor.set_actor(label)
+            return share.federate(["slow"], one, k=4, budget_ms=150)
+        return contextvars.copy_context().run(go)
+    try:
+        # Each caller has its own share, but together they reach the ceiling for shortened deadlines.
+        reasons = [as_caller(f"caller-{n}")[1][0]["reason"] for n in range(5)]
+        assert reasons == ["deadline", "deadline", "deadline", "busy", "busy"]
+        assert started == ["caller-0", "caller-1", "caller-2"]
+        assert share._federation_stuck[("shortened", "slow")] == 3
+        # A request that keeps the server's deadline is not held up by them.
+        monkeypatch.setenv("MEMD_FEDERATED_DEADLINE_MS", "150")
+
+        def full():
+            actor.set_actor("patient")
+            return share.federate(["slow"], one, k=4)
+        assert contextvars.copy_context().run(full)[1] == [{"store": "slow", "reason": "deadline"}]
+        assert started[-1] == "patient" and share._federation_stuck[("store", "slow")] == 1
+    finally:
+        release.set()
+    _until(lambda: share._federation_stuck == {})
+
+
+def test_a_remote_caller_without_an_account_or_token_cannot_shorten_the_deadline(monkeypatch):
+    monkeypatch.setenv("MEMD_FEDERATED_DEADLINE_MS", "2000")
+
+    def remote():
+        access.remote_request.set(True)
+        actor.set_actor("")
+        return share.request_deadline_ms(250), share.request_deadline_ms(None)
+    assert contextvars.copy_context().run(remote) == (2000, 2000)
+    # A local caller (the CLI, an in-process hook) still may.
+    assert share.request_deadline_ms(250) == 250 and share.request_deadline_ms(None) == 2000
+
+
+def test_one_request_runs_a_few_of_its_stores_at_a_time_and_none_after_its_deadline(monkeypatch):
+    monkeypatch.setattr(share, "FEDERATION_PER_CALL", 2)
+    lock = threading.Lock()
+    now = {"running": 0, "most": 0}
+    ran = []
+    release = threading.Event()
+
+    def one(store):
+        ran.append(store)
+        with lock:
+            now["running"] += 1
+            now["most"] = max(now["most"], now["running"])
+        try:
+            if store.startswith("slow"):
+                release.wait(10)
+                return []
+            time.sleep(0.05)
+            return [{"slug": f"{store}-0", "matched": True, "body": "b"}]
+        finally:
+            with lock:
+                now["running"] -= 1
+    # More stores than may run at once: all are served, two at a time.
+    notes, skipped = share.federate([f"fast-{n}" for n in range(5)], one, k=8, budget_ms=3000)
+    assert skipped == [] and sorted(n["slug"] for n in notes) == [f"fast-{n}-0" for n in range(5)]
+    assert now["most"] == 2
+    try:
+        # Its two places are held by hung recalls when the deadline comes: the third store never starts.
+        notes, skipped = share.federate(["slow-a", "slow-b", "fast-x"], one, k=8, budget_ms=150)
+        assert skipped == [{"store": s, "reason": "deadline"} for s in ("slow-a", "slow-b", "fast-x")]
+        assert "fast-x" not in ran
+    finally:
+        release.set()
+    _until(lambda: share._federation_stuck == {})

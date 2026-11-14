@@ -32,7 +32,7 @@ umask 077
 # Serves as the single entry point for setting up local agent integrations from a memd server.
 
 usage() {
-    echo "Usage: bash onboard.sh [--activity-hook] [--handoff] [--token-file PATH] [token] [server-url]" >&2
+    echo "Usage: bash onboard.sh [--activity-hook] [--handoff] [--stores=<list>] [--token-file PATH] [token] [server-url]" >&2
     echo "" >&2
     echo "  Leave the token out to be prompted for it, or use --token-file PATH or an" >&2
     echo "  exported MEMD_TOKEN: a token on the command line is kept in shell history" >&2
@@ -44,6 +44,12 @@ usage() {
     echo "  --handoff        also install the Claude Code SessionEnd/SessionStart hook that" >&2
     echo "                   writes where a session left off in a repository and shows it" >&2
     echo "                   to the next session there (same as MEMD_HANDOFF=1)" >&2
+    echo "  --stores=<list>  have the prompt recall hook and the pi extension search several" >&2
+    echo "                   stores: --stores=all (every store the token reaches) or a" >&2
+    echo "                   comma-separated list of store names, --stores=amber,team" >&2
+    echo "                   (sets MEMD_RECALL_STORES). Without it they search the token's" >&2
+    echo "                   own store. The token must be issued with those additional" >&2
+    echo "                   stores." >&2
     echo "" >&2
     echo "Get a token via: ssh apphost '~/docker/memd/memd-token issue <profile> <label>'" >&2
     exit 1
@@ -61,6 +67,16 @@ case "${MEMD_HANDOFF:-}" in
     1|true|yes|on) handoff_hook=1 ;;
 esac
 token_file=
+valid_stores() {
+    # `all`, or store names as the server registers them. The C locale keeps
+    # [a-z] to ASCII lower case.
+    local LC_ALL=C
+    [[ "$1" =~ ^[a-z][a-z0-9-]*(,[a-z][a-z0-9-]*)*$ ]] || return 1
+    # `all` means every store, so it cannot also be one name in a list: the
+    # server would refuse it on every prompt.
+    [[ "$1" != *,* || ",$1," != *,all,* ]]
+}
+recall_stores=""
 positional=()
 while [ "$#" -gt 0 ]; do
     case "$1" in
@@ -73,6 +89,10 @@ while [ "$#" -gt 0 ]; do
         --token-file=*)
             token_file="${1#--token-file=}"
             [ -n "$token_file" ] || { echo "ERROR: --token-file needs a PATH" >&2; usage; } ;;
+        --stores|--stores=*)
+            recall_stores="${1#--stores=}"
+            valid_stores "$recall_stores" || usage
+            ;;
         *) positional+=("$1") ;;
     esac
     shift
@@ -234,19 +254,29 @@ else
 fi
 
 echo "Onboarding with profile '$profile' token $(short_token)"
+if [ -n "$recall_stores" ]; then
+    echo "Prompt recall will search stores: $recall_stores"
+fi
 
-export SERVER PROFILE="$profile" TOKEN
+# RECALL_STORES is always exported, empty without --stores, so a variable of that
+# name inherited from the caller's shell never reaches the python blocks below.
+export SERVER PROFILE="$profile" TOKEN RECALL_STORES="$recall_stores"
 env_file="$HOME/.config/memd/client.env"
 mkdir -p "$(dirname "$env_file")"
 python3 - "$env_file" <<'PYEOF'
 import os, shlex, sys, tempfile
 path = sys.argv[1]
+values = {"MEMD_URL": os.environ["SERVER"],
+          "MEMD_REMOTE": os.environ["SERVER"],
+          "MEMD_PROFILE": os.environ["PROFILE"],
+          "MEMD_TOKEN": os.environ["TOKEN"]}
+# For pi, which gets its settings from this file when it is sourced. The recall
+# hook takes the setting from its command line; nothing else reads it.
+if os.environ["RECALL_STORES"]:
+    values["MEMD_RECALL_STORES"] = os.environ["RECALL_STORES"]
 fd, temporary = tempfile.mkstemp(dir=os.path.dirname(path))
 with os.fdopen(fd, "w") as output:
-    for key, value in {"MEMD_URL": os.environ["SERVER"],
-                       "MEMD_REMOTE": os.environ["SERVER"],
-                       "MEMD_PROFILE": os.environ["PROFILE"],
-                       "MEMD_TOKEN": os.environ["TOKEN"]}.items():
+    for key, value in values.items():
         output.write("export " + key + "=" + shlex.quote(value) + "\n")
 os.replace(temporary, path)
 PYEOF
@@ -304,7 +334,7 @@ if [ -d "$HOME/.claude" ]; then
     # Exported BEFORE the heredoc runs — the python block reads these from the
     # environment, and exporting afterwards wrote an empty hook command.
     export SERVER PROFILE="$profile" TOKEN MEMD_ACTIVITY_INSTALL="$activity_install" \
-        MEMD_HANDOFF_INSTALL="$handoff_install"
+        MEMD_HANDOFF_INSTALL="$handoff_install" RECALL_STORES="$recall_stores"
 
     # The failure handler must sit on the SAME line as the heredoc redirect.
     python3 - <<'PYEOF' || { fail_step "Failed to merge settings.json"; cp -p "$settings_backup" "$settings_file"; echo "Restored Claude settings from $settings_backup"; }
@@ -337,13 +367,19 @@ entry_cmd = (
     home=shlex.quote(os.environ["HOME"]),
 )
 
+# --stores is for the prompt recall hook alone: the activity and handoff hooks
+# search one store, and their commands are derived from entry_cmd below.
+recall_cmd = entry_cmd
+if os.environ.get("RECALL_STORES"):
+    recall_cmd = "MEMD_RECALL_STORES=" + shlex.quote(os.environ["RECALL_STORES"]) + " " + entry_cmd
+
 # Claude Code expects UserPromptSubmit to be a list of GROUPS:
 #   [{"matcher": "*", "hooks": [{"type": "command", "command": ...}]}]
 # Appending a bare {"command": ...} at the group level produces an entry the
 # harness silently ignores, so build the nested shape.
 new_hook = {
     "type": "command",
-    "command": entry_cmd,
+    "command": recall_cmd,
     "timeout": 15,
     "statusMessage": "memd recall...",
 }

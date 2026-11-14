@@ -112,6 +112,29 @@ post-backup revocations before serving traffic. Never restore a stale backup as
 an ordinary UI rollback. Roll back browser code only to a registry-aware image,
 or disable `MEMD_WEB_OIDC_ISSUER` while keeping registry authentication active.
 
+## Account grants and tokens: review
+
+This part concerns the account administration API of `MEMD_ADMIN_DB`
+([ADMINISTRATION](ADMINISTRATION.md#reviewers)), not the token registry above.
+Its routes take an administrator's session cookie and `X-CSRF-Token`; `/ui/me`
+and `/ui/stores` answer any signed-in caller. Review is a per-store permission
+beside read and write, and these fields carry it:
+
+| Route | Field | Value |
+|---|---|---|
+| `PUT /admin/users/{id}/grants` | `grants.<store>` | `"read"` (read, no review), `"write"` (write and review, its earlier meaning) or `{"permission": "read" or "write", "review": true or false}` with exactly those two keys. Anything else is a 400 and leaves the grants as they were. |
+| `POST /admin/tokens` | `review` | Optional boolean, default `false`. A 400 unless the owner is an administrator or holds review on at least one of the token's stores. |
+| `GET /admin/overview` | `grants[].review` | Boolean. |
+| `GET /admin/overview` | `tokens[].review` | Boolean: whether the token was issued with review. Always `false` for a legacy token. |
+| `GET /admin/overview` | `users[].reviews` | Sorted list of the store ids the user may review: every store for an administrator, none for a disabled account. |
+| `GET /ui/me`, `GET /ui/stores` | `stores[].review` | Boolean beside `id`, `name` and `permission`: whether this caller may review that store. For a token, where it was issued with review and its owner still holds it. |
+
+The inbox routes (`GET /inbox`, `GET /inbox/{id}`, `POST /inbox/{id}/approve`,
+`POST /inbox/{id}/reject`) keep their shape. They answer 403 with a `detail`
+string to a caller without review on the store, and to an approval whose
+`edits` change more than tags and importance when the reviewer does not also
+hold write.
+
 ## Validation
 
 Use Python 3.13. `tests/test_control.py` and `tests/test_admin_web.py` exercise

@@ -4,10 +4,15 @@ Hermetic: temp Git/SQLite stores, a respx-mocked chat endpoint, no model
 backends; the socket guard blocks everything else.
 """
 import asyncio
+import contextvars
+import dataclasses
 import json
 import os
+import sqlite3
 import stat
 import subprocess
+import types
+import uuid
 
 import httpx
 import pytest
@@ -17,9 +22,11 @@ from fastapi.testclient import TestClient
 import memd.mcp as mcp_mod
 import memd.save as save_mod
 import memd.server as server_mod
-from memd import actor, inbox, recall as recall_mod
+from memd import access, actor, control, inbox, recall as recall_mod, registry, share
 from memd.config import Config
+from memd.identity import bind_identity
 from memd.store import list_notes, read_note
+from tests.test_share import _agent, team  # noqa: F401  (fixture)
 
 TOKEN = "i" * 40
 AUTH = {"Authorization": f"Bearer {TOKEN}"}
@@ -59,6 +66,35 @@ def _mcp(client, name, arguments, headers=MCP_HEADERS):
         "params": {"name": name, "arguments": arguments}})
     assert r.status_code == 200, r.text
     return r.json()["result"]
+
+
+def _as_request(fn, *, label="", principal=None, registry_token=None, identity=None):
+    """Run fn in its own context, bound the way a remote request binds its caller."""
+    def run():
+        actor.set_actor(label)
+        access.remote_request.set(True)
+        access.current.set(principal)
+        access.delegated.set(principal is None)
+        registry.principal.set(registry_token)
+        if identity:
+            bind_identity(identity)
+        return fn()
+    return contextvars.copy_context().run(run)
+
+
+def _token_reviewer(label, profile="amber"):
+    """What reviewer_for gives a bearer that has this label and no recorded credential."""
+    return _as_request(lambda: inbox.reviewer_for(profile), label=label)
+
+
+def _stored_ids(cfg, cid, profile="amber"):
+    """(proposer_account, proposer_credential, reviewer_account) as the inbox file holds them."""
+    conn = sqlite3.connect(inbox.inbox_path(cfg, profile))
+    try:
+        return conn.execute("SELECT proposer_account, proposer_credential, reviewer_account "
+                            "FROM candidates WHERE id=?", (cid,)).fetchone()
+    finally:
+        conn.close()
 
 
 FACT = {"title": "Backup window", "body": "Nightly backups of the archive run at 02:30 on lapbox.",
@@ -117,7 +153,7 @@ def test_dry_run_reports_identity_duplicates_and_errors_without_writing(store):
 
 def test_approve_with_edits_writes_through_save_and_records_receipt(store):
     cid = inbox.propose(dict(FACT), "amber", cfg=store, proposer="agent-a")["id"]
-    out = inbox.approve(store, "amber", cid, reviewer="owner",
+    out = inbox.approve(store, "amber", cid, reviewer=inbox.operator_reviewer("owner"),
                         edits={"title": "Archive backup window", "tags": ["backup", "archive"], "host": None})
     assert out["status"] == "approved" and out["edited"]
     receipt = out["receipt"]
@@ -132,12 +168,12 @@ def test_approve_with_edits_writes_through_save_and_records_receipt(store):
     assert item["receipt"]["slug"] == receipt["slug"]
     assert item["original"]["title"] == "Backup window"
     with pytest.raises(inbox.NotPending):
-        inbox.approve(store, "amber", cid, reviewer="owner")
+        inbox.approve(store, "amber", cid, reviewer=inbox.operator_reviewer("owner"))
     with pytest.raises(inbox.NotPending):
-        inbox.reject(store, "amber", cid, reviewer="owner")
+        inbox.reject(store, "amber", cid, reviewer=inbox.operator_reviewer("owner"))
     with pytest.raises(ValueError):
         inbox.approve(store, "amber", inbox.propose({"body": "another fact entirely"}, "amber", cfg=store)["id"],
-                      reviewer="owner", edits={"saved_by": "forged"})
+                      reviewer=inbox.operator_reviewer("owner"), edits={"saved_by": "forged"})
 
 
 def test_failed_approval_stays_pending_with_error_and_reject_writes_nothing(store):
@@ -145,11 +181,11 @@ def test_failed_approval_stays_pending_with_error_and_reject_writes_nothing(stor
                         "amber", cfg=store)["id"]
     assert "supersedes" in inbox.get(store, "amber", cid)["lint"]["error"]
     with pytest.raises(ValueError):
-        inbox.approve(store, "amber", cid, reviewer="owner")
+        inbox.approve(store, "amber", cid, reviewer=inbox.operator_reviewer("owner"))
     item = inbox.get(store, "amber", cid)
     assert item["status"] == "pending" and "supersedes" in item["last_error"]
     before = head(store.clone)
-    out = inbox.reject(store, "amber", cid, reviewer="owner", reason="wrong target")
+    out = inbox.reject(store, "amber", cid, reviewer=inbox.operator_reviewer("owner"), reason="wrong target")
     assert out["status"] == "rejected" and head(store.clone) == before
     item = inbox.get(store, "amber", cid)
     assert item["reason"] == "wrong target" and item["decided_at"]
@@ -439,7 +475,7 @@ def test_settings_parse_conservatively(monkeypatch):
     assert inbox.token_review_mode({"MEMD_INBOX_TOKEN_REVIEW": "yes"}) == "off"
     assert inbox.token_review_mode({"MEMD_INBOX_TOKEN_REVIEW": "others"}) == "others"
     monkeypatch.setenv("MEMD_SAVE_MODE", "inbox")
-    assert inbox.save_routes_to_inbox() is False      # a local caller always saves directly
+    assert inbox.save_routes_to_inbox("amber") is False      # a local caller always saves directly
 
 
 # --------------------------------------------------------------------------- review hardening
@@ -452,10 +488,10 @@ def test_token_reviewer_may_change_only_tags_and_importance(store, monkeypatch):
     for edits in ({"body": "Written only by agent-b."}, {"slug": "repo-hosting-policy"},
                   {"supersedes": "repo-hosting-policy"}):
         with pytest.raises(PermissionError, match="only importance and tags"):
-            inbox.approve(store, "amber", cid, reviewer="agent-b", reviewer_is_token=True, edits=edits)
+            inbox.approve(store, "amber", cid, reviewer=_token_reviewer("agent-b"), edits=edits)
     assert inbox.get(store, "amber", cid)["status"] == "pending"
     # Resending the proposed values unchanged is not a rewrite.
-    out = inbox.approve(store, "amber", cid, reviewer="agent-b", reviewer_is_token=True,
+    out = inbox.approve(store, "amber", cid, reviewer=_token_reviewer("agent-b"),
                         edits={"title": FACT["title"], "importance": 2, "tags": ["backup", "nightly"]})
     note = read_note(store.clone, out["receipt"]["slug"])
     assert note.saved_by == "agent-a" and note.importance == 2 and note.body == FACT["body"]
@@ -464,7 +500,7 @@ def test_token_reviewer_may_change_only_tags_and_importance(store, monkeypatch):
 def test_a_token_rewrite_under_all_is_credited_to_the_token(store, monkeypatch):
     monkeypatch.setenv("MEMD_INBOX_TOKEN_REVIEW", "all")
     cid = inbox.propose(dict(FACT), "amber", cfg=store, proposer="agent-a")["id"]
-    out = inbox.approve(store, "amber", cid, reviewer="agent-b", reviewer_is_token=True,
+    out = inbox.approve(store, "amber", cid, reviewer=_token_reviewer("agent-b"),
                         edits={"body": "Backups moved to 03:00."})
     assert read_note(store.clone, out["receipt"]["slug"]).saved_by == "agent-b"
 
@@ -487,3 +523,292 @@ def test_redaction_covers_pgp_blocks_and_quoted_multiword_secrets():
     assert "lQOYBGVx" not in out and "=AbCd" not in out and "[REDACTED PRIVATE KEY]" in out
     assert "horse" not in out and "two words" not in out
     assert 'password: "[REDACTED]"' in out
+
+
+# --------------------------------------------------------------------------- caller ids and reviewers
+
+
+def test_caller_ids_follow_the_kind_of_credential():
+    session = access.Principal("u-1", "amber", False, {"amber": "write"}, "amber", session=True, csrf="c")
+    token = access.Principal("u-1", "laptop", False, {"amber": "write"}, "amber", token_id="t-9")
+    digest = "0123456789ab" * 2     # a made-up digest, as a legacy principal carries
+    legacy = access.Principal("legacy:" + digest[:12], "legacy", False, {"amber": "write"}, "amber",
+                              token_id=digest)
+
+    def who(**bound):
+        return _as_request(actor.caller, **bound)
+    assert who(label="amber", principal=session) == actor.Caller("amber", "u-1", "session")
+    assert who(label="laptop", principal=token) == actor.Caller("laptop", "u-1", "t-9")
+    assert who(label="legacy", principal=legacy) == actor.Caller("legacy", None, "legacy:0123456789ab")
+    assert who(label="ci", registry_token="r-1") == actor.Caller("ci", None, "r-1")
+    # A personal registry token is both: its bound identity and its own id.
+    assert who(label="phone", registry_token="r-2", identity="Cobalt@Example.com") == \
+        actor.Caller("phone", "identity:cobalt@example.com", "r-2")
+    assert who(label="cobalt@example.com", identity="cobalt@example.com") == \
+        actor.Caller("cobalt@example.com", "identity:cobalt@example.com", "identity:cobalt@example.com")
+    assert who(label="open") == actor.Caller("open", None, None)
+
+    def local():
+        actor.set_actor("mem-inbox distill")
+        bind_identity("cobalt@example.com")     # a per-user store selected in process is not a credential
+        return actor.caller()
+    assert contextvars.copy_context().run(local) == actor.Caller("mem-inbox distill", None, None)
+
+
+def test_candidates_record_a_legacy_token_and_leave_a_local_caller_without_ids(store):
+    local = inbox.propose(dict(FACT), "amber", cfg=store, proposer="mem-import")["id"]
+    assert _stored_ids(store, local) == (None, None, None)
+    with TestClient(server_mod.create_token_app()) as client:
+        over_http = client.post("/propose", headers=AUTH, json={"body": "The office printer is on the guest VLAN."})
+        assert over_http.status_code == 200, over_http.text
+        over_mcp = _mcp(client, "propose", {"content": "The archive NAS exports /srv/share over NFS v4."})
+    credential = "legacy:" + control.digest(TOKEN)[:12]
+    for cid in (over_http.json()["id"], over_mcp["structuredContent"]["id"]):
+        assert _stored_ids(store, cid) == (None, credential, None)
+        assert inbox.get(store, "amber", cid)["proposer"] == "legacy"
+
+
+def test_a_payload_cannot_name_its_proposer(store):
+    forged = {**FACT, "proposer": "someone-else", "proposer_account": "u-1", "proposer_credential": "t-1",
+              "account": "u-1", "credential": "t-1", "caller": {"account": "u-1", "credential": "t-1"}}
+    with TestClient(server_mod.create_token_app()) as client:
+        r = client.post("/propose", headers=AUTH, json=forged)
+    assert r.status_code == 200, r.text
+    assert _stored_ids(store, r.json()["id"]) == (None, "legacy:" + control.digest(TOKEN)[:12], None)
+    assert inbox.get(store, "amber", r.json()["id"])["proposer"] == "legacy"
+
+
+def test_registry_tokens_are_told_apart_by_their_own_ids(store, tmp_path, monkeypatch):
+    monkeypatch.setenv("MEMD_CONTROL_DB", str(tmp_path / "control" / "control.db"))
+    monkeypatch.setenv("MEMD_INBOX_TOKEN_REVIEW", "others")
+    tokens = registry.Registry()
+    tokens.initialize()
+
+    def issue():
+        made = tokens.issue(actor="operator", operation_id=str(uuid.uuid4()), label="shared", owner="team",
+                            purpose="review", stores=["amber"], operations=["save"])
+        return {"Authorization": "Bearer " + made["secret"]}, made["token"]["id"]
+    (first, first_id), (second, second_id) = issue(), issue()
+    with TestClient(server_mod.create_token_app()) as client:
+        mine = client.post("/propose", headers=first, json=FACT)
+        assert mine.status_code == 200, mine.text
+        theirs = _mcp(client, "propose", {"content": "The archive NAS exports /srv/share over NFS v4."},
+                      headers={**MCP_HEADERS, **second})["structuredContent"]["id"]
+        mine = mine.json()["id"]
+        # A registry token has no account: its own id is the credential.
+        assert _stored_ids(store, mine) == (None, first_id, None)
+        assert _stored_ids(store, theirs) == (None, second_id, None)
+        r = client.post(f"/inbox/{mine}/approve", headers=first, json={})
+        assert r.status_code == 403 and "own proposal" in r.json()["detail"]
+        assert client.post(f"/inbox/{mine}/approve", headers=second, json={}).status_code == 200
+        assert client.post(f"/inbox/{theirs}/reject", headers=second, json={}).status_code == 403
+    assert _stored_ids(store, mine) == (None, first_id, None)
+    assert inbox.get(store, "amber", mine)["reviewer"] == "shared"
+
+
+def test_a_queued_publish_records_who_published(team, capsys):
+    admin = team["admin"]
+    assert admin.put("/admin/stores/team", json={"config": {"publish_review": True}}).status_code == 200
+    agent = _agent(team, {"team": "write"})
+    with control.db() as c:
+        owner = c.execute("SELECT id FROM users WHERE username='owner'").fetchone()[0]
+        token_id = c.execute("SELECT id FROM tokens WHERE digest=?",
+                             (control.digest(agent.headers["Authorization"][len("Bearer "):]),)).fetchone()[0]
+    by_token = agent.post("/publish", json={"slug": "archive-backup-window", "target_store": "team"})
+    by_session = admin.post("/publish", json={"slug": "repo-hosting-policy", "target_store": "team"})
+    assert by_token.status_code == 202 and by_session.status_code == 202, (by_token.text, by_session.text)
+    cfg = share._cfg("team")
+    assert _stored_ids(cfg, by_token.json()["inbox_id"], "team") == (team["user"]["id"], token_id, None)
+    assert _stored_ids(cfg, by_session.json()["inbox_id"], "team") == (owner, "session", None)
+    # The local CLI is the operator: what it queues has no ids.
+    assert share.main(["publish", "vmhost-proxmox-vm", "team", "--from", "amber", "--json"]) == 0
+    by_cli = json.loads(capsys.readouterr().out)
+    assert by_cli["queued"] and _stored_ids(cfg, by_cli["inbox_id"], "team") == (None, None, None)
+
+
+def test_candidates_record_accounts_and_decisions_are_audited(accounts):
+    client, app, csrf, agent, cfg = accounts
+    api = TestClient(app)
+    with control.db() as c:
+        owner = c.execute("SELECT id FROM users WHERE username='owner'").fetchone()[0]
+        token_id, member = c.execute("SELECT id, user_id FROM tokens WHERE label='laptop-agent'").fetchone()
+    by_token = api.post("/propose", headers={"Authorization": "Bearer " + agent},
+                        json={"body": "The garage door opener is on the IoT VLAN."})
+    by_session = client.post("/propose", headers={"X-CSRF-Token": csrf},
+                             json={"body": "The owner proposes this from the browser."})
+    assert by_token.status_code == 200 and by_session.status_code == 200, (by_token.text, by_session.text)
+    by_token, by_session = by_token.json()["id"], by_session.json()["id"]
+    assert _stored_ids(cfg, by_token) == (member, token_id, None)
+    assert _stored_ids(cfg, by_session) == (owner, "session", None)
+    assert member != owner
+    assert client.post(f"/inbox/{by_token}/approve", headers={"X-CSRF-Token": csrf}, json={}).status_code == 200
+    assert client.post(f"/inbox/{by_session}/reject", headers={"X-CSRF-Token": csrf},
+                       json={"reason": "not needed"}).status_code == 200
+    # The decision keeps the reviewing account beside the reviewer label ...
+    assert _stored_ids(cfg, by_token) == (member, token_id, owner)
+    assert _stored_ids(cfg, by_session) == (owner, "session", owner)
+    assert client.get(f"/inbox/{by_token}").json()["reviewer"] == "owner"
+    # ... and is in the audit log. A refused or repeated decision is not.
+    assert client.post(f"/inbox/{by_token}/approve", headers={"X-CSRF-Token": csrf}, json={}).status_code == 409
+    with control.db() as c:
+        rows = [tuple(r) for r in c.execute("SELECT actor, action, target FROM audit "
+                                            "WHERE action LIKE 'inbox.%' ORDER BY id")]
+    assert rows == [("owner", "inbox.approve", f"amber:{by_token}"), ("owner", "inbox.reject", f"amber:{by_session}")]
+
+
+def test_two_tokens_with_one_label_are_different_proposers(accounts, monkeypatch):
+    client, app, csrf, _, cfg = accounts
+    monkeypatch.setenv("MEMD_INBOX_TOKEN_REVIEW", "others")
+    with control.db() as c:
+        member = c.execute("SELECT id FROM users WHERE username='agent-user'").fetchone()[0]
+
+    def issue():
+        r = client.post("/admin/tokens", headers={"X-CSRF-Token": csrf},
+                        json={"label": "shared", "user_id": member, "store_id": "amber", "scope": "write"})
+        assert r.status_code == 200, r.text
+        return {"Authorization": "Bearer " + r.json()["token"]}, r.json()["id"]
+    (first, first_id), (second, second_id) = issue(), issue()
+    api = TestClient(app)
+    mine = api.post("/propose", headers=first, json={"body": "Proposed by the first token."}).json()["id"]
+    theirs = api.post("/propose", headers=second, json={"body": "Proposed by the second token."}).json()["id"]
+    assert [i["proposer"] for i in api.get("/inbox", headers=first).json()["items"]] == ["shared", "shared"]
+    assert _stored_ids(cfg, mine)[:2] == (member, first_id) and _stored_ids(cfg, theirs)[:2] == (member, second_id)
+    for headers, own in ((first, mine), (second, theirs)):
+        for decision in ("approve", "reject"):
+            r = api.post(f"/inbox/{own}/{decision}", headers=headers, json={})
+            assert r.status_code == 403 and "own proposal" in r.json()["detail"], (decision, r.text)
+    # The label would have refused these; the credentials differ, so they pass.
+    assert api.post(f"/inbox/{mine}/approve", headers=second, json={}).status_code == 200
+    assert api.post(f"/inbox/{theirs}/reject", headers=first, json={}).status_code == 200
+    assert read_note(cfg.clone, api.get(f"/inbox/{mine}", headers=first).json()["slug"]).saved_by == "shared"
+
+
+def test_a_candidate_without_ids_is_matched_by_label(store, monkeypatch):
+    """Filed by a local caller, or before ids were recorded: the label is all there is."""
+    monkeypatch.setenv("MEMD_INBOX_TOKEN_REVIEW", "others")
+    same = inbox.propose(dict(FACT), "amber", cfg=store, proposer="legacy")["id"]
+    other = inbox.propose({"body": "The office printer is on the guest VLAN."}, "amber", cfg=store,
+                          proposer="mem-import")["id"]
+    assert _stored_ids(store, same) == (None, None, None)
+    with TestClient(server_mod.create_token_app()) as client:
+        for decision in ("approve", "reject"):
+            r = client.post(f"/inbox/{same}/{decision}", headers=AUTH, json={})
+            assert r.status_code == 403 and "own proposal" in r.json()["detail"], (decision, r.text)
+        assert client.post(f"/inbox/{other}/approve", headers=AUTH, json={}).status_code == 200
+    assert inbox.get(store, "amber", same)["status"] == "pending"
+
+
+def test_an_inbox_file_from_before_ids_gains_the_columns_and_keeps_its_rows(store, monkeypatch):
+    monkeypatch.setenv("MEMD_INBOX_TOKEN_REVIEW", "others")
+    old_id = "0123456789abcdef"
+    conn = sqlite3.connect(inbox.inbox_path(store, "amber"))
+    conn.executescript(inbox._SCHEMA)
+    conn.execute("ALTER TABLE candidates ADD COLUMN provenance TEXT")
+    conn.execute("INSERT INTO candidates(id,created,source,proposer,title,body,content_hash) "
+                 "VALUES(?,1.0,'agent','agent-a','Old','Filed before ids were recorded.','h')", (old_id,))
+    conn.commit()
+    conn.close()
+    assert inbox.get(store, "amber", old_id)["proposer"] == "agent-a"
+    assert _stored_ids(store, old_id) == (None, None, None)
+    with pytest.raises(PermissionError, match="own proposal"):
+        inbox.reject(store, "amber", old_id, reviewer=_token_reviewer("agent-a"))
+    assert inbox.reject(store, "amber", old_id, reviewer=_token_reviewer("agent-b"))["status"] == "rejected"
+
+
+def test_two_openers_of_an_older_inbox_file_both_succeed(store, monkeypatch):
+    """Both read the old column list; the slower one must not fail on a column the other added."""
+    path = inbox.inbox_path(store, "amber")
+    conn = sqlite3.connect(path)
+    conn.executescript(inbox._SCHEMA)
+    conn.close()
+    connect, raced = sqlite3.connect, []
+
+    class Slower(sqlite3.Connection):
+        def execute(self, sql, *args):
+            cursor = super().execute(sql, *args)
+            if raced or not sql.startswith("PRAGMA table_info"):
+                return cursor
+            raced.append(True)
+            seen = cursor.fetchall()
+            inbox._connect(path).close()        # the other opener adds the columns first
+            return seen
+    with monkeypatch.context() as patched:
+        patched.setattr(sqlite3, "connect", lambda *args, **kwargs: connect(*args, **kwargs, factory=Slower))
+        assert inbox.list_candidates(store, "amber")["total"] == 0 and raced
+    conn = sqlite3.connect(path)
+    columns = [r[1] for r in conn.execute("PRAGMA table_info(candidates)")]
+    conn.close()
+    assert sorted(columns[-4:]) == ["proposer_account", "proposer_credential", "provenance", "reviewer_account"]
+    assert len(columns) == len(set(columns))
+
+
+def test_decisions_need_a_reviewer_the_inbox_built(store):
+    cid = inbox.propose(dict(FACT), "amber", cfg=store, proposer="agent-a")["id"]
+    built = inbox.operator_reviewer("owner")
+
+    class Lookalike(inbox.Reviewer):
+        pass
+    subclass = Lookalike("owner", operator=True)
+    object.__setattr__(subclass, "_built", built._built)
+    forged = ["owner", None, ("owner", False), inbox.Reviewer("owner", operator=True),
+              dataclasses.replace(built, label="someone-else"), subclass,
+              types.SimpleNamespace(label="owner", account=None, credential=None, is_token=False,
+                                    can_write=True, operator=True, _built=built._built)]
+    for reviewer in forged:
+        with pytest.raises(PermissionError, match="reviewer the inbox built"):
+            inbox.approve(store, "amber", cid, reviewer=reviewer)
+        with pytest.raises(PermissionError, match="reviewer the inbox built"):
+            inbox.reject(store, "amber", cid, reviewer=reviewer)
+    assert inbox.get(store, "amber", cid)["status"] == "pending"
+    assert read_note(store.clone, "backup-window") is None
+    assert inbox.reject(store, "amber", cid, reviewer=built)["status"] == "rejected"
+    # A remote request is never the operator, and the console reviews only its own store.
+    with pytest.raises(PermissionError):
+        _as_request(lambda: inbox.operator_reviewer("owner"), label="legacy")
+    with pytest.raises(PermissionError):
+        _as_request(lambda: inbox.console_reviewer("cobalt@example.com"), identity="amber@example.com")
+    console = _as_request(lambda: inbox.console_reviewer("amber@example.com"), identity="amber@example.com")
+    assert (console.label, console.account, console.is_token, console.operator) == \
+        ("amber@example.com", "identity:amber@example.com", False, False)
+
+
+def test_reviewer_for_describes_sessions_tokens_and_the_operator(store, monkeypatch):
+    session = access.Principal("u-1", "amber", False, {"amber": "write"}, "amber", session=True, csrf="c",
+                               reviews=frozenset({"amber"}))
+    reader = dataclasses.replace(session, grants={"amber": "read"}, reviews=frozenset())
+    token = access.Principal("u-2", "laptop", False, {"amber": "write"}, "amber", token_id="t-9")
+    made = _as_request(lambda: inbox.reviewer_for("amber"), label="amber", principal=session)
+    assert made == inbox.Reviewer("amber", "u-1", "session", is_token=False, can_write=True, operator=False,
+                                  store="amber")
+    with pytest.raises(PermissionError, match="review access"):
+        _as_request(lambda: inbox.reviewer_for("amber"), label="amber", principal=reader)
+    with pytest.raises(PermissionError, match="Agent tokens cannot review"):
+        _as_request(lambda: inbox.reviewer_for("amber"), label="laptop", principal=token)
+    monkeypatch.setenv("MEMD_INBOX_TOKEN_REVIEW", "others")
+    made = _as_request(lambda: inbox.reviewer_for("amber"), label="laptop", principal=token)
+    assert made == inbox.Reviewer("laptop", "u-2", "t-9", is_token=True, can_write=True, operator=False,
+                                  store="amber")
+    actor.set_actor("")
+    assert inbox.reviewer_for("amber") == inbox.Reviewer("local", operator=True)
+
+
+def test_decisions_are_audited_only_when_administration_is_enabled(store, tmp_path, monkeypatch):
+    operator = inbox.operator_reviewer("cli:amber")
+    admin_db = tmp_path / "control" / "admin.db"
+    first = inbox.propose(dict(FACT), "amber", cfg=store)["id"]
+    assert inbox.reject(store, "amber", first, reviewer=operator)["status"] == "rejected"
+    assert not admin_db.exists()
+    # An administration database that cannot take the row never fails the decision.
+    monkeypatch.setenv("MEMD_ADMIN_DB", str(admin_db))
+    control.initialize()
+    with control.db() as c:
+        c.execute("DROP TABLE audit")
+    second = inbox.propose({"body": "The office printer is on the guest VLAN."}, "amber", cfg=store)["id"]
+    assert inbox.reject(store, "amber", second, reviewer=operator)["status"] == "rejected"
+    control.initialize()
+    third = inbox.propose({"body": "The archive NAS exports /srv/share over NFS v4."}, "amber", cfg=store)["id"]
+    assert inbox.approve(store, "amber", third, reviewer=operator)["receipt"]["saved"] is True
+    assert _stored_ids(store, third) == (None, None, None)       # the operator has no account
+    with control.db() as c:
+        rows = [tuple(r) for r in c.execute("SELECT actor, action, target FROM audit ORDER BY id")]
+    assert rows == [("cli:amber", "inbox.approve", f"amber:{third}")]

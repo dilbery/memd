@@ -174,14 +174,31 @@ entities (notes scoped, tagged or stating facts, plus current facts), and at mos
 40 tag entities, so the work per request stays bounded; an entity past the cap
 still has its page.
 
+**Inbox** is where an account reviews [proposed memories](#review-inbox-optional).
+The tab appears only for a signed-in account that holds review on at least one
+store (an administrator reviews every store); unlocking with a token never
+shows it. It lists a store's candidates by status with their lint flags, and
+each candidate opens with its text, proposed details and a preview of what
+approving it would do. Any reviewer can approve, reject with an optional reason,
+and correct the tags and importance; changing the title, summary or text also
+needs write access to that store.
+
 **Onboarding** provides portable setup instructions, copyable commands and client
 downloads. Commands use the current server address and serving profile.
 `/help` retains a plain text reference. Both root-path MCP and `/mcp/` remain
 available. The dashboard has no external assets or build dependencies and supports
 small screens and system light/dark mode. **Settings** connects local, Git and
 Obsidian stores and sets whether notes published into a store need review.
-**Administration** manages users, store grants, scoped expiring tokens (with
-optional additional stores for [team sharing](#team-sharing-optional)),
+Each store also has a **Review** choice: no review, agent saves need review, or
+all saves need review by someone else, where every save and publish waits in
+the store's inbox, the account that proposed a candidate cannot approve or
+reject it, and reviewers change only its tags and importance (the Inbox says
+so for such a store). Choosing the last warns when fewer than two accounts can
+review the store, and says that notes arriving through its Git repository or
+Obsidian vault are not reviewed.
+**Administration** manages users, store grants (read, write and review, per
+store), scoped expiring tokens (with optional additional stores for
+[team sharing](#team-sharing-optional), and optionally allowed to review),
 revocation and audit history. The audit trail records administrative actions and,
 as actor, action and target only (never query text), recalls, reads and exports;
 recall and read entries expire after `MEMD_AUDIT_READ_DAYS` (90). Browser accounts
@@ -228,7 +245,43 @@ sidecar are in `memd/integrations/`; see
 Onboarding installs `memd-recall-hook` as a `UserPromptSubmit` hook: each prompt's
 text is recalled and relevant notes are added as context (`MEMD_TOP_N` matches, 8 by
 default; `MEMD_MAX_CHARS`, 14,000; `MEMD_TIMEOUT`, 4 seconds). Any failure adds
-nothing and never blocks the prompt. An optional second hook
+nothing and never blocks the prompt.
+
+The hook searches one store, the token's own, unless `MEMD_RECALL_STORES` is set
+in its environment (beside `MEMD_PROFILE` in the hook command). The pi extension
+reads the same variable. Onboarding writes it for both with
+`bash onboard.sh --stores=all [server-url]` or `--stores=amber,team`; a run
+without `--stores` removes it again.
+
+- unset or empty: the single-store request, unchanged;
+- `all`: `scope: "all"`, every store the token reaches, its own first;
+- `amber,team`: `stores: ["amber", "team"]`, a comma-separated list of store names.
+
+With `all` or a list the request is a
+[federated recall](#team-sharing-optional): no `profile` is sent, notes are
+headed `### [store] slug`, and the hook's hint under the context says to pass
+`store="<that store>"` to `read` for a note marked `[store]`. The activity and
+handoff hooks below are not affected and search one store.
+
+The setting never widens what a token may read. A token reaches other stores
+only through the **Additional stores** chosen when it is issued, which cannot be
+changed later, so an existing token is reissued first (see
+[Administration](docs/ADMINISTRATION.md#team-stores-and-sharing)). One store the
+token does not reach refuses the whole request (HTTP 403). The hook then retries
+once with the single-store request, if at least one second of `MEMD_TIMEOUT`
+(default 4 s) is left, and puts one line above the context saying that
+multi-store recall was refused and which store is shown. A 400 is handled the
+same way, and pi does the same within its 5 s. Any other failure adds no
+context, as before, and the prompt is never held up.
+
+`MEMD_TOP_N` (default 8; `MEMD_RECALL_K` in pi) and the core index limit are
+shared across the stores, not applied to each, so fewer of your own matches and
+core entries appear; raise `MEMD_TOP_N` for more matches. The hook also sends
+`deadline_ms`, its timeout less 0.8 s (pi: 4.2 s), so the server skips a store
+that is still running then, and names it in the context, instead of the whole
+recall timing out.
+
+An optional second hook
 recalls on what the agent is *doing*. Install it with
 `bash onboard.sh --activity-hook [server-url]` (or `MEMD_ACTIVITY_HOOK=1`); it
 is off otherwise. `memd-activity-hook` runs as a `PostToolUse` hook on `Bash`,
@@ -346,6 +399,7 @@ offers seven tools. None can delete a note.
 | `read(slug, offset?, limit?, revision?, store?, recall_id?)` | Read an authoritative note by slug, with revision metadata and continuation for longer bodies. Pass the `recall_id` of the recall the slug came from; see [Learning from usage](#learning-from-usage-optional). |
 | `save(title, body, ...)` | Store a durable fact and return a persistence/index/sync receipt. |
 | `propose(title, body, ...)` | File a fact for human review instead of saving it; see [Review inbox](#review-inbox-optional). |
+| `proposals(status?, id?, limit?, offset?, store?)` | What became of the facts you proposed: your own candidates with their status, reviewer and rejection reason; `id` returns one with its full text. See [Review inbox](#review-inbox-optional). |
 | `ask(question, k?, stores?, host?, tags?)` | One short answer drawn only from your notes, with the notes it cites, a confidence and any gaps. See [Cited answers](#cited-answers-ask). |
 | `timeline(subject, predicate?, at?)` | Exact lookup of extracted facts: what is true about a subject now, or on a date. See [Timeline facts](#timeline-facts-optional). |
 | `publish(slug, target_store, store?)` | Copy one of your notes into a shared (team) store with provenance; see [Team sharing](#team-sharing-optional). |
@@ -740,24 +794,71 @@ store before approval.
   `supersede`) and `slug`, `related` notes, `near_duplicates` (keyword or vector),
   `conflicts` and `warnings`, and `error` when save would refuse the fact as
   proposed (a missing `supersedes` target, a stale `expected_revision`). An
-  identical pending candidate is returned rather than filed twice.
+  identical pending candidate is returned rather than filed twice. A reworded
+  one is filed and flagged: the fact is compared with every pending candidate by
+  the word-overlap check `mem-inbox distill` uses (session handoffs are not
+  compared with each other), and the stored lint lists those it restates under
+  `pending_duplicates` (id and title), for reviewers. The proposer's reply names
+  only its own matches there and says nothing about anyone else's, not even how
+  many: a count would let a proposer test guesses about what others have
+  pending. The reply to an identical candidate that someone else filed is
+  filtered the same way, and its `lint` is worked out for the fact as this
+  caller sent it: the stored one shows the `slug` and `supersedes` the first
+  proposer asked for. A save queued by `MEMD_SAVE_MODE=inbox` names the
+  proposer's own matches in a warning.
+- **Own proposals.** `GET /proposals?status=` (`pending` by default, or
+  `approved`, `rejected`, `all`; `offset`, `limit`), `GET /proposals/{id}` and the
+  `proposals` MCP tool show a caller what became of the candidates it filed in a
+  store, newest first: status, channel, title and an excerpt, decision time,
+  reviewer, rejection reason, the slug and revision once approved, whether the
+  reviewer edited it, and the error of a failed approval; by id, the full text as
+  well. So a rejection reason reaches the proposer. They need read access to the
+  store and nothing more. "Own" is decided by the recorded ids, account and
+  credential together: a second token of the same user, a token with the same
+  label and that user's browser session do not see the candidate, and by id it
+  answers 404 exactly as a missing one does. A local caller has no ids and is
+  matched by its label, against candidates that have none. Totals and counts
+  cover the caller's own candidates only.
 - **Storage.** Per store, a side file next to the index (`memd.db` ->
   `memd.inbox.db`, owner-only) holds each candidate: title, body, proposed metadata,
   channel (`agent`, `save`, `transcript`, `handoff` or `import:<kind>`), proposer
   label, status (`pending`/`approved`/`rejected`), reviewer, decision time, rejection reason,
   the resulting slug, revision and full save receipt, and the original text when
-  the reviewer edited it. Decided candidates are pruned after 180 days; at most
-  1,000 may be pending.
+  the reviewer edited it. Labels are not unique, so a candidate also records the
+  account and the credential that proposed it (a user and one of their tokens or
+  their session, a legacy or registry token, a signed-in identity) and the account
+  that decided it. A local caller (`mem-inbox distill`, `mem-import`, the
+  in-process handoff hook) has no ids, and neither has a candidate filed before
+  they were recorded. Decided candidates are pruned after 180 days; at most 1,000
+  may be pending.
 - **Review.** `GET /inbox?status=`, `GET /inbox/{id}`,
   `POST /inbox/{id}/approve {"edits"?}` and `POST /inbox/{id}/reject {"reason"?}`
-  need a signed-in account session (password login, CSRF-checked) with write access
-  to the store. Agent tokens get 403 unless `MEMD_INBOX_TOKEN_REVIEW` allows them:
-  `others` lets a write token review candidates proposed under a different label,
-  but change only their tags and importance (a token must not rewrite another's
-  text and approve it alone); `all` also its own, with any edit, and a token's
-  rewrite is then credited to that token. Approval sends the (edited) fact through
+  need a signed-in account session (password login, CSRF-checked) that holds
+  review on the store. Review is a permission of its own beside read and write,
+  set per store with the grant (see
+  [Reviewers](docs/ADMINISTRATION.md#reviewers)): an administrator reviews every
+  store, a member the stores where it was granted, and write does not include
+  it. A reviewer who does not also hold write may change a candidate's tags and
+  importance and nothing else (403 otherwise); the approved note is still
+  written. An agent token reviews in one of two ways. Issued with review
+  (`"review": true` on `POST /admin/tokens`), it reviews the stores it reaches
+  where its owner holds review at that moment. Otherwise it gets 403 unless the
+  older instance-wide switch `MEMD_INBOX_TOKEN_REVIEW` allows it: `others` lets
+  any write token review, `all` does the same and lifts the two limits that
+  follow. A token, however it came to review, cannot decide a candidate its own
+  credential proposed and may change only tags and importance (a token must not
+  rewrite another's text and approve it alone). Under `all` it may decide its
+  own and, holding write, change any field; its rewrite is then credited to
+  that token. "Its own" is decided by the recorded
+  ids: two tokens that share a label are different proposers, and each may
+  review the other's candidates but not its own. Only a candidate with no ids is
+  matched by label. Approval sends the (edited) fact through
   the normal `save` and records the receipt; otherwise the note's `saved_by` is the
   proposer, and the inbox records the reviewer and any original text. A failed save leaves the candidate pending with the error shown.
+  With administration enabled (`MEMD_ADMIN_DB`), each decision is also written to
+  the audit log as `inbox.approve` or `inbox.reject` with the reviewer and
+  `<store>:<candidate id>`; without it the candidate's own reviewer and decision
+  time are the record.
   Editable fields are save's: title, body, tags, importance, host, description,
   source, dates, pinned, volatility, verify, supersedes, slug and
   expected_revision (`null` removes one). A deployment without accounts has no
@@ -772,9 +873,30 @@ store before approval.
   (HTTP status 202), so agents do not retry. Account sessions and local callers
   (the CLI, stdio MCP) still save directly. The default, `direct`, leaves save
   unchanged.
+- **Review policy.** Each store has a `review_policy` that says which saves wait
+  and who decides them: **Review** in Settings → the store's **Configure**,
+  `PUT /admin/stores/{id}` with `{"config": {"review_policy": "four-eyes"}}`, or
+  `MEMD_<STORE>_REVIEW_POLICY` for a store configured by environment. `open`,
+  the default, is everything above. `agents` files an agent token's `save` into
+  that store as a candidate whatever `MEMD_SAVE_MODE` says; account sessions
+  and local callers still save directly. `four-eyes` files every save and
+  publish into the store through memd, a signed-in session's included, with the
+  same queued receipt (HTTP 202). A candidate there is decided by a reviewer
+  with an account other than the one that proposed it: a session, or a token
+  issued with review. The proposing account gets 403 for approve and for
+  reject, whichever of its tokens or sessions asks, and administrators are not
+  exempt. `MEMD_INBOX_TOKEN_REVIEW` gives no token a say there and `all` lifts
+  nothing. Nobody changes more than a candidate's tags and importance, and the
+  personal console's edit and retract are refused. The local CLI is the
+  operator and is not bound by it. The API refuses a value that is none of the
+  three (400); in the environment such a value counts as `four-eyes` and is
+  logged, so a typing mistake cannot switch review off. What the policy covers
+  and what it does not: [Review policy](docs/ADMINISTRATION.md#review-policy).
 - **Handoffs.** Session handoff notes from the Claude Code handoff hook arrive
   on the `handoff` channel (see [Claude Code hooks](#claude-code-hooks)); a newer
   one from the same credential replaces the older pending one for its repository.
+  A pending handoff is read back only by the credential that filed it, by id as
+  above: a second token does not see it, even one with the same label or owner.
 - **Transcripts.** `mem-inbox distill <transcript.jsonl|->` reads a Claude Code
   transcript, keeps only user and assistant text (no tool calls, tool output,
   thinking or system reminders), redacts obvious secrets (private keys, bearer and
@@ -905,7 +1027,7 @@ and store names are chosen by the operator.
 |---|---|---|---|
 | `memd_build_info` | gauge | `version`, `app_commit` | Always 1; the running version and application commit (as `/health`). |
 | `process_start_time_seconds` | gauge | | Process start, Unix time. |
-| `memd_http_requests_total` | counter | `route`, `status` | HTTP requests by route (`recall`, `read`, `save`, `propose`, `ask`, `publish`, `timeline`, `mcp`, `health`, `stats`, ...; anything else is `other`) and status class (`2xx`, `4xx`, ...). |
+| `memd_http_requests_total` | counter | `route`, `status` | HTTP requests by route (`recall`, `read`, `save`, `propose`, `proposals`, `ask`, `publish`, `timeline`, `mcp`, `health`, `stats`, ...; anything else is `other`) and status class (`2xx`, `4xx`, ...). |
 | `memd_http_request_duration_seconds` | histogram | `route` | HTTP request latency. |
 | `memd_mcp_tool_calls_total` / `memd_mcp_tool_duration_seconds` | counter / histogram | `tool`, `outcome` | MCP tool calls (`ok` or `error`) and latency. |
 | `memd_recall_arm_duration_seconds` | histogram | `arm` | Recall stages: `embed`, `vector`, `bm25`, `fresh`, `rerank`, `total`. |
@@ -1012,6 +1134,10 @@ store it came from. Nothing changes until a caller asks for it: recall without
 store and grants as described in
 [Administration](docs/ADMINISTRATION.md#team-stores-and-sharing).
 
+To have the recall hook and the pi extension search several stores on every
+prompt, set `MEMD_RECALL_STORES` on the client (see
+[Claude Code hooks](#claude-code-hooks)).
+
 **Publish.** `publish(slug, target_store, store?)` (MCP tool, `POST /publish`,
 `mem-share publish`) needs read access to the source store (`store`, default your
 own) and write access to the target, through the same grants, token scopes,
@@ -1058,14 +1184,23 @@ granted, their own first). Each named store is resolved exactly like a `profile`
 argument, one refused name refuses the whole call with 403, and the reply never
 says whether a refused store exists. Recall runs once per store, four at a time,
 under one deadline (embed + rerank deadlines + 1.5 s, or
-`MEMD_FEDERATED_DEADLINE_MS`). Query matches are fused by reciprocal rank across
+`MEMD_FEDERATED_DEADLINE_MS`). A caller with a shorter timeout of its own sends
+`deadline_ms`: it can only shorten that deadline, and not below 100 ms. A value
+that is not a positive number is ignored, and so is `deadline_ms` on a
+single-store recall. Query matches are fused by reciprocal rank across
 stores (each store's best match, then each store's second, ...) and cut to `k`.
 Every note carries `store`, excerpts carry `store`, and the rendered context
 marks each heading `### [store] slug`. The reply lists the `stores` searched and
 `stores_skipped` (a store that failed or missed the deadline, with the reason).
+When any store was skipped the context also ends with one line naming them,
+`[Stores not searched: team (deadline), cobalt (PermissionError).]`, counted
+inside `max_chars`; if every store was skipped, that line is the whole context.
+For a present-state query the Current facts block of the first store (the
+caller's own under `scope: "all"`) is appended under the heading
+`### [store] Current facts (timeline)`, if that store was searched and the block
+fits; facts of the other stores are not shown.
 A federated recall gets one `recall_id`, logged in each store's usage log with the
-matches shown from that store (a `read` that names its `store` finds it there). It
-has no current-facts block.
+matches shown from that store (a `read` that names its `store` finds it there).
 
 `read` takes `store` (or its older name `profile`) and checks it the same way,
 so reading a federated result needs the matching grant: `read(slug, store=team)`.
@@ -1351,6 +1486,7 @@ for the hooks and bridge on client machines are in the last table.
 | `MEMD_STORES_LOCAL_DOMAIN` | unset | The one email domain whose users get a short `u-<localpart>` repository name; other domains keep theirs in the name. |
 | `MEMD_CONTROL_DB` | unset | The token registry database; see above. |
 | `MEMD_<STORE>_PUBLISH_REVIEW` | `true` | For an environment-configured store: `false` saves published notes directly instead of queueing them in its review inbox (administered stores use the `publish_review` setting, **Published notes need review** in Settings). |
+| `MEMD_<STORE>_REVIEW_POLICY` | `open` | For an environment-configured store: its [review policy](#review-inbox-optional), `open`, `agents` (agent-token saves into it wait in its review inbox) or `four-eyes` (every save and publish waits and is decided from another account). Any other value is treated as `four-eyes`. Administered stores use the `review_policy` setting, **Review** in Settings. |
 | `MEMD_FEDERATED_DEADLINE_MS` | embed + rerank deadlines + 1500 | One deadline for a whole federated recall, 100..30000; stores still running are skipped and reported. |
 | `MEMD_<PROFILE>_KEY_FILE` | unset | Key file (32 random bytes, mode 0600) of a legacy profile's [encrypted store](#encrypted-personal-stores-optional). |
 | `MEMD_METRICS_PUBLIC` | unset | `1` serves `GET /metrics` without a token to loopback callers that carry no forwarding header; see [Metrics](#metrics-prometheus). |
@@ -1384,7 +1520,7 @@ for the hooks and bridge on client machines are in the last table.
 | Variable | Default | Purpose |
 | --- | --- | --- |
 | `MEMD_SAVE_MODE` | `direct` | `inbox` files an agent token's MCP/HTTP `save` in the review inbox instead of writing it; sessions and local callers save directly. |
-| `MEMD_INBOX_TOKEN_REVIEW` | `off` | Whether agent tokens may review the inbox: `off`, `others` (only candidates proposed under another label) or `all`. |
+| `MEMD_INBOX_TOKEN_REVIEW` | `off` | The older, instance-wide way to let every write token review the inbox: `off` (no token reviews through this switch), `others` (only candidates proposed by another credential) or `all`. A token issued with review may review whatever this is set to. |
 | `MEMD_USAGE_LOG` | `on` | Recall usage log next to each index: `on` (normalised query text kept in that file only), `hash` (query hash only) or `off`. |
 | `MEMD_USAGE_RETENTION_DAYS` | `90` | Usage log rows older than this are pruned, 1..3650. |
 | `MEMD_USAGE_BOOST` | `off` | `on` applies the bounded per-note weight learned from the usage log in recall fusion. |
@@ -1412,6 +1548,7 @@ private file `~/.config/memd/client.env`.
 | `MEMD_REMOTE` / `MEMD_URL` | unset | Server URL for the hooks and bridge / for the pi extension. The Python hooks recall in process when `MEMD_REMOTE` is unset. |
 | `MEMD_TOKEN` | unset | The client's bearer token. A token in an explicit `MEMD_ENV_FILE` wins over an inherited one, and the bridge rereads the file after a 401. |
 | `MEMD_TOP_N` / `MEMD_MAX_CHARS` / `MEMD_TIMEOUT` | `8` / `14000` / `4` | `memd-recall-hook`: matches, injected characters and recall timeout in seconds. The pi extension reads `MEMD_RECALL_K` (8) and `MEMD_MAX_CHARS`. |
+| `MEMD_RECALL_STORES` | unset | Client setting, read by the recall hook and the pi extension: `all` or a comma-separated list of stores (`amber,team`) to recall across on every prompt; unset recalls from the token's own store. See [Claude Code hooks](#claude-code-hooks). |
 | `MEMD_BRIDGE_TIMEOUT` | `30` | Seconds the stdio bridge waits for one reply. |
 | `MEMD_FALLBACK_CHECKOUT` | unset | Read-only checkout `python -m memd.hooks.auto_recall` greps when memd is unreachable. |
 | `MEMD_ACTIVITY_HOOK`, `MEMD_ACTIVITY_ERRORS`, `MEMD_ACTIVITY_DEADLINE_MS`, `MEMD_ACTIVITY_TOP_N`, `MEMD_ACTIVITY_MAX_CHARS`, `MEMD_ACTIVITY_MAX_RECALLS` | see [Claude Code hooks](#claude-code-hooks) | The activity hook: install switch, error recall, deadline (1500 ms), notes (3), characters (2000) and recalls per session (40). |

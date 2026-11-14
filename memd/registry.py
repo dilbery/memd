@@ -378,3 +378,72 @@ def enforce(operation, requested):
     if token_id is not None:
         return Registry().authorize(token_id, operation, requested)
     return requested
+
+
+LINEAGE_DEPTH = 32   # rotations followed back; a chain is never this long in practice
+
+
+def lineage(credential: str | None) -> tuple[str, ...]:
+    """The credential and the tokens it was rotated from, newest first; rotation keeps the caller the same proposer."""
+    if not credential:
+        return ()
+    if credential == "session" or credential.startswith("legacy:") or credential.startswith("identity:"):
+        return (credential,)
+    if not configured():
+        return (credential,)
+    try:
+        with Registry().connection(write=False) as db:
+            rows = db.execute(
+                """WITH RECURSIVE chain(id, parent, depth) AS (
+                       SELECT id, rotated_from, 0 FROM tokens WHERE id=?
+                       UNION ALL
+                       SELECT t.id, t.rotated_from, c.depth + 1 FROM tokens t JOIN chain c ON t.id = c.parent
+                       WHERE c.depth < ?)
+                   SELECT id FROM chain ORDER BY depth""",
+                (credential, LINEAGE_DEPTH)).fetchall()
+    except (sqlite3.Error, OSError, ControlError):
+        return (credential,)
+    seen = set()
+    result = []
+    for row in rows:
+        tid = row["id"]
+        if tid not in seen:
+            seen.add(tid)
+            result.append(tid)
+    if credential not in result:
+        result.insert(0, credential)
+    return tuple(result)
+
+
+def rotation_family(credential: str | None) -> frozenset[str]:
+    """Every token in the credential's rotation tree: its first token and all rotated from it.
+
+    One holder has them all during a rotation's overlap, so none may review a
+    candidate another filed. Unlike `lineage`, a registry that cannot be read
+    raises ControlError: the self-review check must refuse, not narrow.
+    """
+    if not credential:
+        return frozenset()
+    if credential == "session" or credential.startswith("legacy:") or credential.startswith("identity:"):
+        return frozenset((credential,))
+    if not configured():
+        return frozenset((credential,))
+    try:
+        with Registry().connection(write=False) as db:
+            rows = db.execute(
+                """WITH RECURSIVE up(id, parent, depth) AS (
+                       SELECT id, rotated_from, 0 FROM tokens WHERE id=?
+                       UNION ALL
+                       SELECT t.id, t.rotated_from, u.depth + 1 FROM tokens t JOIN up u ON t.id = u.parent
+                       WHERE u.depth < ?),
+                   root(id) AS (SELECT id FROM up ORDER BY depth DESC LIMIT 1),
+                   down(id, depth) AS (
+                       SELECT id, 0 FROM root
+                       UNION
+                       SELECT t.id, d.depth + 1 FROM tokens t JOIN down d ON t.rotated_from = d.id
+                       WHERE d.depth < ?)
+                   SELECT id FROM down""",
+                (credential, LINEAGE_DEPTH, LINEAGE_DEPTH)).fetchall()
+    except (sqlite3.Error, OSError) as exc:
+        raise ControlError(f"the token registry could not be read: {type(exc).__name__}") from exc
+    return frozenset(row["id"] for row in rows) | {credential}

@@ -4,6 +4,7 @@ Hermetic: temp git clones, temp key files and temp output directories; no
 network. Two stores: ``amber`` (plaintext, the shared 3-note clone with a review
 branch) and ``cobalt`` (encrypted with its own store key).
 """
+import contextvars
 import json
 import os
 import sqlite3
@@ -137,6 +138,35 @@ def test_create_restore_round_trip_plain_and_encrypted(world, tmp_path):
     assert reg.execute("SELECT count(*) FROM sessions").fetchone()[0] == 0   # sessions dropped
     reg.close()
     assert backup.verify(path, world["key"])["members"] == manifest["members"]
+
+
+def test_inbox_proposer_and_reviewer_ids_survive_a_restore(world, config, tmp_path):
+    """Whose a candidate is, and who decided it, is in the inbox file and nowhere else."""
+    from memd import access, inbox
+    from memd.actor import Caller
+
+    def session_reviewer():
+        access.remote_request.set(True)
+        access.current.set(access.Principal("u-2", "cobalt", False, {"amber": "write"}, "amber", session=True,
+                                            reviews=frozenset({"amber"})))
+        return inbox.reviewer_for("amber")
+    decided = inbox.propose({"title": "Backup window", "body": "Nightly backups run at 02:30."}, "amber",
+                            cfg=config, proposer="laptop", caller=Caller("laptop", "u-1", "t-9"),
+                            precomputed_lint={})["id"]
+    inbox.reject(config, "amber", decided, reviewer=contextvars.copy_context().run(session_reviewer))
+    local = inbox.propose({"title": "Printer", "body": "The office printer is on the guest VLAN."}, "amber",
+                          cfg=config, proposer="mem-import", precomputed_lint={})["id"]
+    path, manifest = _create(world)
+    target = tmp_path / "restored"
+    backup.restore(path, world["key"], target)
+    amber = next(s for s in manifest["stores"] if s["name"] == "amber")
+    restored = sqlite3.connect(target / amber["members"]["inbox"])
+    rows = {r[0]: r[1:] for r in restored.execute(
+        "SELECT id, status, proposer, proposer_account, proposer_credential, reviewer, reviewer_account "
+        "FROM candidates")}
+    restored.close()
+    assert rows == {decided: ("rejected", "laptop", "u-1", "t-9", "cobalt", "u-2"),
+                    local: ("pending", "mem-import", None, None, None, None)}
 
 
 def test_index_is_not_in_the_bundle(world):

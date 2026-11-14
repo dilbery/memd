@@ -247,6 +247,15 @@ def normalize_recall_args(payload: dict) -> dict:
             except (TypeError, ValueError, OverflowError):
                 value = default
             out[key] = max(minimum, min(maximum, value))
+    if "deadline_ms" in payload and not isinstance(payload["deadline_ms"], bool):
+        # Read by a federated recall only (memd.share.deadline_ms). Anything but
+        # a finite positive number is dropped, never defaulted.
+        try:
+            value = float(payload["deadline_ms"])
+        except (TypeError, ValueError, OverflowError):
+            value = 0.0
+        if 0 < value < float("inf"):
+            out["deadline_ms"] = max(100, int(value))
     if isinstance(payload.get("host"), str) and payload["host"].strip():
         out["host"] = payload["host"].strip()
     tags = payload.get("tags")

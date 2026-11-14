@@ -73,7 +73,7 @@ def test_sdk_client_round_trip(store, path, mode):
 
     anyio.run(main)
     assert (seen["version"] == "2026-07-28") == (mode != "legacy"), seen["version"]
-    assert seen["tools"] == ["recall", "save", "timeline", "ask", "read", "propose", "publish"]
+    assert seen["tools"] == ["recall", "save", "timeline", "ask", "read", "propose", "proposals", "publish"]
     save = seen["save"]
     assert not save.is_error and save.structured_content["saved"] is True
     assert read_note(store, save.structured_content["slug"]).saved_by == "legacy"

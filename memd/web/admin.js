@@ -1,10 +1,17 @@
 (() => {
   "use strict";
   const $ = id => document.getElementById(id);
-  const {api, notice, element: el} = window.memd;
-  let overview = null, editStore = null, editUser = null, loading = false, shownReview = true;
+  const {api, notice, element: el, canReview, reviewPolicy} = window.memd;
+  let overview = null, editStore = null, editUser = null, loading = false, shownReview = true, shownPolicy = "open";
   const date = value => value ? new Date(value * 1000).toLocaleString() : "Never";
   const option = (value, label) => { const node = el("option", "", label); node.value = value; return node; };
+  // A store's card names its review policy only when the policy holds saves back.
+  const POLICY = {agents: "Agent saves need review", "four-eyes": "All saves need review by someone else"};
+  function policyLine(store) {
+    const label = POLICY[reviewPolicy(store)];
+    if (!label) return [];
+    const line = el("p", "small"); line.append(el("span", "chip", label)); return [line];
+  }
   function button(label, action, className = "quiet") {
     const node = el("button", className, label); node.type = "button";
     node.addEventListener("click", async () => {
@@ -78,7 +85,7 @@
         if (!confirm(`Revoke “${token.label}”? Any agent using it will immediately lose access.`)) return;
         await api("/admin/tokens/" + token.id, undefined, undefined, "DELETE"); await loadOverview();
       }, "quiet danger"));
-      row.append(name, el("td", "", token.store_id + Object.entries(token.extra || {}).map(([store, scope]) => ` + ${store} (${scope})`).join("")), el("td", "", token.scope === "write" ? "Read + write" : "Read only"), el("td", "small", date(token.last_used)), status, action);
+      row.append(name, el("td", "", token.store_id + Object.entries(token.extra || {}).map(([store, scope]) => ` + ${store} (${scope})`).join("")), el("td", "", (token.scope === "write" ? "Read + write" : "Read only") + (token.review ? ", review" : "")), el("td", "small", date(token.last_used)), status, action);
       $("tokens-table").append(row);
     }
     if (!overview.tokens.length) { const row = el("tr"); const cell = el("td", "muted", "No tokens have been issued yet."); cell.colSpan = 6; row.append(cell); $("tokens-table").append(row); }
@@ -99,13 +106,13 @@
           await api("/admin/users/" + user.id, {role: user.role === "admin" ? "member" : "admin"}, undefined, "PATCH"); await loadOverview();
         }));
       }
-      const grants = overview.grants.filter(g => g.user_id === user.id).map(g => `${g.store_id} (${g.permission})`).join(", ");
+      const grants = overview.grants.filter(g => g.user_id === user.id).map(g => `${g.store_id} (${g.permission}${canReview(g) ? ", review" : ""})`).join(", ");
       row.append(el("td", "", user.username), el("td", "", user.role), el("td", "", user.disabled ? "Disabled" : "Active"), el("td", "small", user.role === "admin" ? "All stores" : grants || "None"), actions);
       $("users-table").append(row);
     }
     for (const store of overview.stores) {
       const card = el("article", "panel store-card");
-      card.append(el("span", "eyebrow", ({existing:"EXISTING STORE",local:"LOCAL MARKDOWN",git:"GIT REPOSITORY",obsidian:"OBSIDIAN VAULT"}[store.kind])), el("h2", "", store.name), el("p", "small muted", store.config.repo_ssh || store.config.vault_path || "Private Markdown files with Git history."));
+      card.append(el("span", "eyebrow", ({existing:"EXISTING STORE",local:"LOCAL MARKDOWN",git:"GIT REPOSITORY",obsidian:"OBSIDIAN VAULT"}[store.kind])), el("h2", "", store.name), el("p", "small muted", store.config.repo_ssh || store.config.vault_path || "Private Markdown files with Git history."), ...policyLine(store));
       const actions = el("div", "action-row"); actions.append(button("Configure", () => openStore(store), "secondary"));
       for (const [action,label] of [["test","Test connection"],["sync","Sync now"],["reindex","Reindex"]]) actions.append(button(label, async () => {
         await api(`/admin/stores/${store.id}/${action}`, {}); await loadOverview();
@@ -155,6 +162,23 @@
     $("vault-fields").hidden = kind !== "obsidian";
     $("crypt-fields").hidden = kind === "obsidian";
   }
+  const policies = () => [...$("store-review").querySelectorAll("input")];
+  const chosenPolicy = () => policies().find(radio => radio.checked)?.value || "open";
+  // Indexed by how many accounts can review the store: none, or one.
+  const FEW = ["No account can review this store, so nothing saved into it could be approved. Give two accounts review access under Administration.",
+    "Only one account can review this store, so nothing that account saves, itself or through its agent tokens, could be approved. Give a second account review access under Administration."];
+  // Both notes say what "four-eyes" will mean for this store; neither stops the save.
+  function reviewNotes() {
+    const strict = chosenPolicy() === "four-eyes", count = editStore?.reviewers;
+    // The count is the server's (enabled accounts that may review, administrators
+    // included). An older server and a store not yet created have none: no warning.
+    const few = strict && Number.isInteger(count) && count < 2 ? FEW[Math.max(count, 0)] : "";
+    // Written only when it changes: this runs at every key typed in the address, and a
+    // live region says its sentence again each time it is written.
+    if ($("store-review-few").textContent !== few) notice("store-review-few", few);
+    // A remote feeds the store whatever its kind, so the address counts as it will be sent.
+    $("store-review-unreviewed").hidden = !strict || !(["git", "obsidian"].includes($("store-kind").value) || $("store-remote").value.trim());
+  }
   function openStore(store) {
     editStore = store; $("store-form").reset(); notice("store-error");
     $("store-title").textContent = store ? "Configure " + store.name : "Add memory store";
@@ -167,9 +191,12 @@
     $("store-include").value = (cfg.include || ["**/*.md"]).join("\n"); $("store-exclude").value = (cfg.exclude || []).join("\n");
     $("store-interval").value = cfg.sync_interval ?? 300;
     shownReview = store ? store.publish_review !== false : true; $("store-publish-review").checked = shownReview;
-    fields(); $("store-dialog").showModal();
+    shownPolicy = reviewPolicy(store); policies().forEach(radio => { radio.checked = radio.value === shownPolicy; });
+    fields(); reviewNotes(); $("store-dialog").showModal();
   }
-  $("store-kind").addEventListener("change", fields);
+  $("store-kind").addEventListener("change", () => { fields(); reviewNotes(); });
+  $("store-review").addEventListener("change", reviewNotes);
+  $("store-remote").addEventListener("input", reviewNotes);
   $("store-add").addEventListener("click", () => openStore(null));
   $("store-form").addEventListener("submit", event => {
     event.preventDefault(); submit(event.target, "store-error", async () => {
@@ -184,6 +211,8 @@
       // Sent only when changed, so saving other settings never pins a store's
       // environment default (MEMD_<STORE>_PUBLISH_REVIEW) as its own setting.
       if ($("store-publish-review").checked !== shownReview) config.publish_review = $("store-publish-review").checked;
+      // Likewise the policy, for MEMD_<STORE>_REVIEW_POLICY.
+      if (chosenPolicy() !== shownPolicy) config.review_policy = chosenPolicy();
       const payload = {id: $("store-id").value, name: $("store-name").value, kind: $("store-kind").value, config};
       await api(editStore ? "/admin/stores/" + editStore.id : "/admin/stores", payload, undefined, editStore ? "PUT" : "POST");
       $("store-dialog").close(); await window.memd.loadIdentity(); await loadOverview();
@@ -200,17 +229,28 @@
   function openGrants(user) {
     editUser = user; $("grants-title").textContent = "Store access · " + user.username; notice("grants-error"); $("grant-fields").replaceChildren();
     if (user.role === "admin") $("grant-fields").append(el("p", "muted", "Administrators already have access to all stores. These grants apply if the account becomes a member."));
-    for (const store of overview.stores) {
-      const label = el("label", "grant-row", store.name); const select = el("select"); select.dataset.store = store.id;
+    overview.stores.forEach((store, index) => {
+      const granted = overview.grants.find(g => g.user_id === user.id && g.store_id === store.id);
+      const row = el("div", "grant-row grant-review"); const label = el("label", "", store.name); label.htmlFor = "grant-access-" + index;
+      const select = el("select"); select.id = label.htmlFor; select.dataset.store = store.id;
       select.append(option("", "No access"), option("read", "Read only"), option("write", "Read and write"));
-      select.value = overview.grants.find(g => g.user_id === user.id && g.store_id === store.id)?.permission || "";
-      label.append(select); $("grant-fields").append(label);
-    }
+      select.value = granted?.permission || "";
+      const check = el("label", "check"); const box = el("input"); box.type = "checkbox"; box.dataset.review = store.id;
+      box.setAttribute("aria-label", "Can review " + store.name);
+      box.checked = !!granted && canReview(granted); box.disabled = !select.value;
+      // A new access choice starts from what it always meant (review came with
+      // write, never with read); the box then says otherwise.
+      select.addEventListener("change", () => { box.disabled = !select.value; box.checked = select.value === "write"; });
+      check.append(box, "Can review"); row.append(label, select, check); $("grant-fields").append(row);
+    });
     $("grants-dialog").showModal();
   }
   $("grants-form").addEventListener("submit", event => {
     event.preventDefault(); submit(event.target, "grants-error", async () => {
-      const grants = {}; $("grant-fields").querySelectorAll("select").forEach(s => { if (s.value) grants[s.dataset.store] = s.value; });
+      const grants = {}; $("grant-fields").querySelectorAll(".grant-review").forEach(row => {
+        const select = row.querySelector("select");
+        if (select.value) grants[select.dataset.store] = {permission: select.value, review: row.querySelector("input").checked};
+      });
       await api(`/admin/users/${editUser.id}/grants`, {grants}, undefined, "PUT"); $("grants-dialog").close(); await loadOverview();
     });
   });
@@ -233,6 +273,15 @@
       label.append(text, select); $("token-extra").append(label);
     }
     if (!granted.length) $("token-extra").append(el("p", "small muted", "The owner has no access to other stores."));
+    reviewOffer();
+  }
+  // A token reviews only where its owner does (overview users[].reviews), so the
+  // box is offered when one of the token's stores is among them. The server checks again.
+  function reviewOffer() {
+    const owner = overview.users.find(u => u.id === $("token-user").value);
+    const chosen = [$("token-store").value, ...[...$("token-extra").querySelectorAll("select")].filter(s => s.value).map(s => s.dataset.store)];
+    const offered = !owner?.reviews || chosen.some(id => owner.reviews.includes(id));
+    $("token-review").disabled = !offered; if (!offered) $("token-review").checked = false;
   }
   $("token-add").addEventListener("click", () => {
     $("token-form").reset(); notice("token-error"); $("token-user").replaceChildren(); $("token-store").replaceChildren(); $("token-extra").replaceChildren();
@@ -241,11 +290,12 @@
     extraStores(); $("token-dialog").showModal();
   });
   for (const id of ["token-user", "token-store"]) $(id).addEventListener("change", extraStores);
+  $("token-extra").addEventListener("change", reviewOffer);
   $("token-form").addEventListener("submit", event => {
     event.preventDefault(); submit(event.target, "token-error", async () => {
       const days = Number($("token-expiry").value);
       const extra = {}; $("token-extra").querySelectorAll("select").forEach(s => { if (s.value) extra[s.dataset.store] = s.value; });
-      const result = await api("/admin/tokens", {label: $("token-name").value, user_id: $("token-user").value, store_id: $("token-store").value, scope: $("token-scope").value, expires: days ? Date.now() / 1000 + days * 86400 : null, extra_stores: extra});
+      const result = await api("/admin/tokens", {label: $("token-name").value, user_id: $("token-user").value, store_id: $("token-store").value, scope: $("token-scope").value, expires: days ? Date.now() / 1000 + days * 86400 : null, extra_stores: extra, review: $("token-review").checked});
       $("token-dialog").close(); reveal("Access token created", "Copy this token into your agent or use it with the onboarding installer.", result.token); await loadOverview();
     });
   });
@@ -257,7 +307,7 @@
     if (!identity.session) { overview = null; clearPrivate(); }
     else if (!identity.admin) {
       $("stores-list").replaceChildren();
-      for (const store of identity.stores || []) { const card = el("article", "panel"); card.append(el("h2", "", store.name), el("p", "muted", store.permission === "write" ? "Read and write access" : "Read-only access")); $("stores-list").append(card); }
+      for (const store of identity.stores || []) { const card = el("article", "panel"); card.append(el("h2", "", store.name), el("p", "muted", (store.permission === "write" ? "Read and write access" : "Read-only access") + (canReview(store) ? ", can review the inbox" : "")), ...policyLine(store)); $("stores-list").append(card); }
     }
   });
   addEventListener("memd-tab", event => { if (["settings", "admin"].includes(event.detail)) loadOverview(); });

@@ -21,3 +21,10 @@ select,textarea{font:inherit;color:var(--text);background:var(--surface);border:
 .chip-tag:hover { filter: brightness(1.15); }
 .chip-tag:focus-visible { outline: 2px solid currentColor; outline-offset: 2px; }
 .chip-active { cursor: pointer; border: 0; font: inherit; outline: 2px solid currentColor; }
+
+/* Review: the "Can review" column of the grants dialog, and the Inbox tab. */
+.grant-review{grid-template-columns:1fr 160px auto}.grant-review select{width:100%}.grant-review .check{white-space:nowrap}.form-grid label.check input:disabled{cursor:default}
+.inbox-filter{display:flex;flex-wrap:wrap;gap:8px 16px}.inbox-filter label{max-width:100%}#inbox-candidate-meta{margin:6px 0 18px}.inbox-review{margin-top:16px}.inbox-details{display:grid;grid-template-columns:auto minmax(0,1fr);gap:6px 16px;margin:0;font-size:12px}.inbox-details dt{color:var(--muted)}.inbox-details dd{margin:0;overflow-wrap:anywhere}input[readonly],textarea[readonly]{background:var(--soft)}#inbox-reject-dialog{max-width:520px}#inbox-reject-name{font-weight:600;overflow-wrap:anywhere}
+@media(max-width:640px){.grant-review{grid-template-columns:1fr}}
+/* The store dialog's Review choice: one option and its help per row, then what the choice means for this store. */
+.review-policy .check-field+.check-field{margin-top:10px}.review-policy .notice{margin:12px 0 8px}

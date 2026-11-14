@@ -99,6 +99,14 @@ def validate_config(kind, incoming, previous=None):
         if not isinstance(incoming["publish_review"], bool):
             raise ValueError("publish_review must be true or false.")
         cfg["publish_review"] = incoming["publish_review"]
+    if "review_policy" in incoming:
+        # memd.inbox: which saves into this store wait for review, and who may
+        # decide them. Exactly one of the three names here; only a value set by
+        # hand is read more loosely (memd.inbox.review_policy).
+        from memd.inbox import REVIEW_POLICIES
+        if incoming["review_policy"] not in REVIEW_POLICIES:
+            raise ValueError("review_policy must be open, agents or four-eyes.")
+        cfg["review_policy"] = incoming["review_policy"]
     if "key_file" in incoming:
         value = incoming["key_file"]
         if value and (not isinstance(value,str) or len(value)>4096 or not Path(value).is_absolute()):

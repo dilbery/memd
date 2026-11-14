@@ -84,8 +84,9 @@ README section on team sharing).
    own store as it is; nobody gains access to another member's personal store.
 3. Decide review. **Published notes need review** (Settings → the store's
    **Configure**; `publish_review` in its configuration) is on by default: a
-   published note waits in the team store's review inbox until a member with
-   write access approves it. Clear the box and save to have published notes
+   published note waits in the team store's review inbox until a member who
+   may review it approves it (see [Reviewers](#reviewers)). Clear the box and
+   save to have published notes
    saved directly; `PUT /admin/stores/team` with `{"config":
    {"publish_review": false}}` does the same. A store configured by
    environment uses `MEMD_<STORE>_PUBLISH_REVIEW=false`; for a registered store
@@ -115,6 +116,16 @@ README section on team sharing).
    Revocation and expiry work as for any token. Additional stores cannot be
    changed after issue: issue a new token and revoke the old one.
 
+   The recall hook and the pi extension name no store either, so they keep
+   recalling from the main store whatever the token reaches. To have them search
+   `team` on every prompt, set `MEMD_RECALL_STORES` on the client: `all` (every
+   store the token reaches) or a list such as `amber,team`.
+   `bash onboard.sh --stores=all` writes it for both. A value that names a
+   store the token does not reach is refused; the hook then shows the main store
+   alone, under a line saying so. The matches and core entries shown are shared
+   across the stores, not added per store (see the README section on Claude Code
+   hooks).
+
 Publishing needs read on the source and write on the target; federated recall
 needs read on every store it names, and `scope: "all"` covers only granted
 stores. An encrypted store's notes are published into an unencrypted store only
@@ -122,6 +133,166 @@ with an explicit `allow_decrypted_publish`. Run `mem-share status --store team`
 in the container to list published notes whose source changed since (`behind`);
 a member who can also read the source sees the same in `read` and `recall`
 (`upstream`).
+
+## Reviewers
+
+Deciding the candidates in a store's review inbox (see the README section on
+the review inbox) is a permission of its own, set per store beside read and
+write. A grant is read or write, each with or without review:
+
+| Grant | Recall, read | Save, propose, publish into | Review the inbox | Change a candidate's text |
+|---|---|---|---|---|
+| read | yes | no | no | no |
+| read + review | yes | no | yes | no |
+| write | yes | yes | no | no |
+| write + review | yes | yes | yes | yes |
+
+Administrators review every store. A reviewer approves and rejects, and may
+change a candidate's tags and importance. Changing its title, text or any other
+field needs write as well. An approved note is written to the store whether or
+not the reviewer could write it, and is attributed to whoever proposed it. A
+member with read + review cannot save or propose into the store, so cannot
+approve a note of their own.
+
+Set it in Administration where a user's store access is edited, or through the
+API. Each store takes `"read"`, `"write"` or an object that says both; the
+request replaces all of the user's grants:
+
+```sh
+curl -X PUT https://memory.example.com/admin/users/<id>/grants -b session.cookies \
+  -H "X-CSRF-Token: $CSRF" -H 'Content-Type: application/json' \
+  -d '{"grants":{"team":{"permission":"read","review":true},"amber":"write"}}'
+```
+
+The strings keep their earlier meaning: `"read"` is read without review and
+`"write"` is write with review, so an existing script still creates writers who
+can review. A writer who must not review needs the object form,
+`{"permission":"write","review":false}`.
+
+**Reviewing tokens.** An agent token holds review only when it is issued with
+it: in the token form, or with `"review": true`:
+
+```sh
+curl -X POST https://memory.example.com/admin/tokens -b session.cookies \
+  -H "X-CSRF-Token: $CSRF" -H 'Content-Type: application/json' \
+  -d '{"label":"review-agent","user_id":"<id>","store_id":"team","scope":"read","review":true}'
+```
+
+This is refused unless the owner is an administrator or holds review on at
+least one of the token's stores, main or additional. The token then reviews the
+stores it reaches where its owner holds review at that moment. Like its read and
+write access this is checked on every request, so removing the owner's review
+removes the token's at once. A token does not decide a candidate its own
+credential proposed, and changes only tags and importance. Review cannot be
+added to a token after issue: issue a new one and revoke the old one.
+
+`MEMD_INBOX_TOKEN_REVIEW` is the older, instance-wide way to let tokens
+review, and still works: `others` lets every write token review, and `all`
+also lifts those two limits (a rewrite still needs write). It is the only way
+for legacy file tokens and registry tokens, which hold no review of their own.
+A registry token is a write token when its operations include `save`; one
+without it reviews nothing, whatever the switch says.
+
+**Upgrading.** Until this permission existed, write included review. The first
+start on a version that has it adds the review flag to the administration
+database and sets it on every existing write grant, once and in one
+transaction, so every account can do exactly what it could before. Read grants
+and existing tokens get no review. After that the flag is the administrator's
+to change: a restart never puts back a review that was removed. Instances that
+share one administration database can be started on the new version together.
+An older build cannot change grants in an upgraded database, so take the usual
+backup of the control directory first; the path is forward.
+
+### Review policy
+
+Each store has a review policy: which saves wait in its review inbox, and who
+may decide them. Choose it under **Review** in Settings → the store's
+**Configure**, or set `review_policy` in its configuration:
+
+```sh
+curl -X PUT https://memory.example.com/admin/stores/team -b session.cookies \
+  -H "X-CSRF-Token: $CSRF" -H 'Content-Type: application/json' \
+  -d '{"config":{"review_policy":"four-eyes"}}'
+```
+
+The value is `open`, `agents` or `four-eyes`, and anything else is refused
+(400). `POST /admin/stores` takes it for a new store. A store configured by
+environment uses `MEMD_<STORE>_REVIEW_POLICY`; for a registered store without
+the setting (such as the existing serving store) Settings shows that
+environment value and keeps using it until you change the choice. In the
+environment, case does not matter and `four_eyes` is accepted. A value there
+that is none of the three is treated as `four-eyes` and logged as a warning, so
+a typing mistake cannot switch review off.
+
+| Policy | In Settings | Saves that wait in the inbox | Who may decide a candidate | What a reviewer may change |
+|---|---|---|---|---|
+| `open` (default) | No review | Agent-token saves, when `MEMD_SAVE_MODE=inbox` | Anyone holding review; a token, not a candidate its own credential proposed | Tags and importance; any field for a reviewer who also holds write |
+| `agents` | Agent saves need review | Agent-token saves into this store, whatever `MEMD_SAVE_MODE` says | As `open` | As `open` |
+| `four-eyes` | All saves need review by someone else | Every save and publish into this store through memd, a signed-in session's included | A reviewer with an account that is not the proposer's | Tags and importance, for everyone |
+
+A publish is held back the same way: an agent token's under `agents`, every
+one under `four-eyes`, even with **Published notes need review** off. A save
+that waits is answered with the queued receipt (HTTP 202, `queued: true` and
+the candidate's `inbox_id`), the one `MEMD_SAVE_MODE=inbox` gives an agent
+token. The policy holds back nothing from a local caller on the server (the
+CLI, stdio MCP, `mem-share`): the operator's saves are written directly, and a
+publish of theirs waits only where **Published notes need review** is on.
+
+Under `four-eyes`:
+
+- Only a reviewer with an account decides: a signed-in session that holds
+  review on the store, or a token issued with review. `MEMD_INBOX_TOKEN_REVIEW`
+  gives no token a say in such a store, and `all` lifts nothing. Legacy file
+  tokens and registry tokens can still save into it (the save waits) and never
+  review it.
+- The account that proposed a candidate can neither approve nor reject it
+  (403). The account, not the credential: a user's session and all of their
+  tokens are one proposer.
+- A candidate saved by a credential that belongs to no account (a legacy file
+  token, or a registry token that is no one's personal token) is the operator's
+  to decide, with `mem-inbox` on the server: whoever holds such a credential may
+  hold a reviewing account too, so no reviewer can be shown to be a second one
+  (403). Issue agents account tokens to have their saves reviewed in the Inbox.
+- A candidate with no ids at all was filed on the server (`mem-inbox distill`,
+  `mem-import`) or before ids were recorded. Any such reviewer may decide it.
+- Nobody changes a candidate's text: tags and importance only, also for a
+  reviewer who holds write. To have the text corrected, reject the candidate
+  with a reason; its proposer reads the reason through `proposals` and
+  proposes again.
+- The personal console's edit and retract are refused in such a store, and its
+  Inbox follows the same rules with the signed-in identity as the account.
+- Administrators are not exempt. They can change the policy, and every change
+  is written to the audit log as `store.review_policy` with
+  `<store>:<old>-><new>`, the policy in effect before and after.
+- The local `mem-inbox` CLI is the operator, who already has the store on
+  disk, and is not bound by any of this.
+
+**Fewer than two reviewers.** Under `four-eyes` an account cannot approve what
+it saved itself, through its session or through its agent tokens. A store that
+only one account may review can therefore approve nothing that account saves,
+and a store nobody may review can approve nothing at all. Settings warns when
+fewer than two enabled accounts may review the store (administrators count;
+`reviewers` in `GET /admin/overview`) and saves the choice all the same. Give a
+second account review before you turn the policy on.
+
+**What it covers, and what it does not.** `four-eyes` covers memd's own write
+paths: save, publish, approval and the console's edits. A store fed by a Git
+remote or an Obsidian vault also takes in whatever arrives there, and that is
+not reviewed: `/reindex` with pull, a store sync and its scheduler, the
+resolution of a vault conflict, and repointing the store at another remote.
+Those are the operator's and the administrator's channels, and Settings says so
+when the policy is chosen for such a store. The policy does not defend against
+the operator, who has the disk and the Git remote, or against an administrator
+who changes it; it makes the second visible in the audit log.
+
+`memd-doctor` accepts a queued receipt for its save probe and reports which of
+the two it saw. A queued probe that an approval would save beside the probe
+note, not over it, still fails, as a direct save that forks does. Against a
+store that queues its token the probes are never written, so both read-back
+checks (the probe's and the omp probe's) are skipped. The doctor then sends the
+text of its probe that is already waiting (and omp a fixed one), which the inbox
+folds into the waiting candidate: the store holds at most one of each until a
+reviewer rejects them, not one more every run.
 
 ## Encrypted stores
 

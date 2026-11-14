@@ -13,6 +13,7 @@ import httpx
 
 from memd.registry import Registry, ControlError, Conflict, Denied
 from memd.identity import bind_identity
+from memd.inbox import PolicyRefusal
 from memd.oidc import identity_from_claims, OidcError
 from memd.save import RevisionConflict, CommitOutcomeUnknown
 from memd.store import StoreUnavailable
@@ -223,6 +224,9 @@ async def operation(fn,*args,**kwargs):
         raise HTTPException(409,str(exc)) from None
     except FileNotFoundError:
         raise HTTPException(404,"Memory not found") from None
+    except PolicyRefusal as exc:
+        # The store's review policy refused, not ownership; its sentence names no path or store.
+        raise HTTPException(403,str(exc)) from None
     except PermissionError:
         raise HTTPException(403,"You can access only your own memories") from None
     except (StoreUnavailable,CommitOutcomeUnknown):
@@ -257,7 +261,8 @@ def user_inbox_decide(candidate_id, decision, data, *, reviewer):
     if decision == "reject":
         if set(data) - {"reason"}:
             raise ValueError("Unsupported inbox fields")
-        return inbox.reject(cfg, cfg.profile, candidate_id, reviewer=reviewer, reason=data.get("reason") or "")
+        return inbox.reject(cfg, cfg.profile, candidate_id, reviewer=inbox.console_reviewer(reviewer),
+                            reason=data.get("reason") or "")
     edits = data.get("edits") or {}
     if set(data) - {"edits"} or not isinstance(edits, dict) or set(edits) - INBOX_EDITS:
         raise ValueError("Only the title, summary, memory text, tags and importance can be edited")
@@ -271,7 +276,7 @@ def user_inbox_decide(candidate_id, decision, data, *, reviewer):
     # The console session is the caller: its bound identity selects the store,
     # exactly as an authenticated bearer's does for save.
     access.delegated.set(True)
-    return inbox.approve(cfg, cfg.profile, candidate_id, reviewer=reviewer, edits=edits)
+    return inbox.approve(cfg, cfg.profile, candidate_id, reviewer=inbox.console_reviewer(reviewer), edits=edits)
 
 
 async def inbox_operation(fn,*args,**kwargs):

@@ -649,12 +649,14 @@ def current_facts_block(db_path, query: str, *, limit: int = BLOCK_LIMIT) -> tup
     return "### Current facts (timeline)\n" + "\n".join(lines), len(rows)
 
 
-def append_current_facts(shaped: dict, *, query: str, db_path, max_chars) -> dict:
+def append_current_facts(shaped: dict, *, query: str, db_path, max_chars, store: str | None = None) -> dict:
     """Append the current-facts block to rendered recall text when it fits.
 
     Only for present-state queries (recall.CURRENT_INTENT). Ranking and the
     rendered notes are untouched; the block is added after them only if the
     whole text stays within max_chars. Any failure leaves ``shaped`` as it was.
+    `store` labels the heading `[store]`, for a recall across several stores
+    that shows the facts of one.
     """
     try:
         from memd.recall import CURRENT_INTENT
@@ -665,6 +667,8 @@ def append_current_facts(shaped: dict, *, query: str, db_path, max_chars) -> dic
         block, count = current_facts_block(db_path, query)
         if not count:
             return shaped
+        if store:
+            block = block.replace("### ", f"### [{store}] ", 1)
         budget = _number(max_chars, DEFAULT_MAX_CHARS, 256, 100000)
         text = shaped.get("text") or ""
         joined = f"{text}\n\n{block}" if text else block

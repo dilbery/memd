@@ -40,14 +40,36 @@ def own_account():
     return p
 
 
-def view_identity(p):
+def store_entries(p):
+    """The stores a caller reaches, each with its access, review and the store's review policy."""
+    from memd.inbox import review_policy
     stores = control.stores() if control.enabled() else {}
+    return [{"id":key,"name":stores.get(key,{}).get("name",key),"permission":permission,"review":key in p.reviews,
+             "review_policy":review_policy(key,config=stores.get(key,{}).get("config"))}
+            for key,permission in (p.grants.items() if p else [])]
+
+
+def view_identity(p):
     return {"ok":True,"enabled":control.enabled(),"authenticated":bool(p),
             "username":p.label if p else None,"user_id":p.id if p else None,
             "admin":bool(p and p.admin),"session":bool(p and p.session),
             "csrf":p.csrf if p and p.session else "", "default_store":p.default if p else "",
-            "stores":[{"id":key,"name":stores.get(key,{}).get("name",key),"permission":permission}
-                      for key,permission in (p.grants.items() if p else [])]}
+            "stores":store_entries(p)}
+
+
+def grant_fields(value):
+    """One entry of a grants body as (permission, review), or None when it is neither form.
+
+    The strings keep the meaning they had before review was its own flag, so
+    "write" still grants review and an existing script creates no writer who
+    cannot review. The object form says both.
+    """
+    if isinstance(value,str):
+        return (value,value == "write") if value in ("read","write") else None
+    if isinstance(value,dict) and set(value) == {"permission","review"} and isinstance(value["review"],bool) \
+            and isinstance(value["permission"],str) and value["permission"] in ("read","write"):
+        return value["permission"],value["review"]
+    return None
 
 
 def install(app):
@@ -144,11 +166,13 @@ def install(app):
             # `access` is the store access a token issued for this user can
             # reach, from the same function that authorizes its requests; the
             # token form lists additional stores from it (issue_token checks).
+            # `reviews` are the stores the user may review, from the same place.
             users = []
             for r in c.execute("SELECT id,username,role,disabled,created FROM users ORDER BY username").fetchall():
                 principal = access.user_principal(c,r)
-                users.append({**dict(r),"access":dict(principal.grants) if principal else {}})
-            grants = [dict(r) for r in c.execute("SELECT * FROM grants")]
+                users.append({**dict(r),"access":dict(principal.grants) if principal else {},
+                              "reviews":sorted(principal.reviews) if principal else []})
+            grants = [{**dict(r),"review":bool(r["review"])} for r in c.execute("SELECT * FROM grants")]
             # Read entries would bury the admin events; they stay queryable in the table.
             marks = ",".join("?" * len(control.READ_AUDIT_ACTIONS))
             audit = [dict(r) for r in c.execute(
@@ -204,20 +228,22 @@ def install(app):
     def update_grants(uid:str,payload:dict,p=Depends(administrator)):
         grants = payload.get("grants",{})
         known = control.stores()
-        if not isinstance(grants,dict) or any(key not in known or value not in {"read","write"} for key,value in grants.items()):
-            raise HTTPException(400,"Choose existing stores and read/write permissions.")
+        chosen = {key:grant_fields(value) for key,value in grants.items()} if isinstance(grants,dict) else None
+        if chosen is None or any(key not in known or fields is None for key,fields in chosen.items()):
+            raise HTTPException(400,'Choose existing stores, each "read", "write" (write and review) or {"permission": "read"|"write", "review": true|false}.')
         with control.db() as c:
             if not c.execute("SELECT id FROM users WHERE id=?",(uid,)).fetchone():
                 raise HTTPException(404,"Unknown user.")
             c.execute("DELETE FROM grants WHERE user_id=?",(uid,))
-            c.executemany("INSERT INTO grants VALUES(?,?,?)",[(uid,key,value) for key,value in grants.items()])
+            c.executemany("INSERT INTO grants(user_id,store_id,permission,review) VALUES(?,?,?,?)",
+                          [(uid,key,permission,int(review)) for key,(permission,review) in chosen.items()])
             control.audit(c,p.label,"grants.update",uid)
         return {"ok":True}
 
     @app.post("/admin/tokens")
     def add_token(payload:dict,p=Depends(administrator)):
         try:
-            result = control.issue_token(payload.get("label"),payload.get("user_id"),payload.get("store_id"),payload.get("scope","read"),payload.get("expires"),actor=p.label,extra_stores=payload.get("extra_stores"))
+            result = control.issue_token(payload.get("label"),payload.get("user_id"),payload.get("store_id"),payload.get("scope","read"),payload.get("expires"),actor=p.label,extra_stores=payload.get("extra_stores"),review=payload.get("review",False))
         except ValueError as exc:
             raise HTTPException(400,str(exc))
         return {"ok":True,**result}
@@ -232,8 +258,7 @@ def install(app):
 
     @app.get("/ui/stores")
     def list_stores(p=Depends(signed_in)):
-        return {"ok":True,"stores":[{"id":key,"name":control.stores().get(key,{}).get("name",key),"permission":scope}
-                                     for key,scope in p.grants.items()]}
+        return {"ok":True,"stores":store_entries(p)}
 
     @app.get("/ui/export")
     def export_store(profile:str | None=None,p=Depends(signed_in)):

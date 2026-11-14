@@ -56,6 +56,12 @@ a fresh terminal. A GUI/IDE process must receive the environment too.
   an explicitly configured profile still supports older single-store setups.
 - Other clients: MCP URL, bearer header, REST base/routes and stdio bridge details.
 
+Recall across several stores is set up with the installer, not on this page:
+`bash onboard.sh --stores=all` or `--stores=amber,team` makes the prompt
+recall hook and the pi extension search several stores. This needs a token
+issued with additional stores; a personal token reaches its own store only.
+See the README section on Claude Code hooks.
+
 Setup uses the name `memd-personal` and never removes existing configurations.
 Users with an already-managed memd connection are told not to add a duplicate.
 Normal client tool approvals remain. Client instructions were checked against

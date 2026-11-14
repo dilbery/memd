@@ -14,6 +14,7 @@ import os
 import re
 import shlex
 import sys
+import time
 import urllib.request
 import urllib.error
 
@@ -86,6 +87,8 @@ def _resolve_token():
 REMOTE = os.environ.get("MEMD_REMOTE", "https://memd.example.com")
 TOKEN = _resolve_token()
 PROFILE = os.environ.get("MEMD_PROFILE", "amber")
+# Unset: recall from PROFILE alone. "all" or "amber,team": recall across stores.
+RECALL_STORES = os.environ.get("MEMD_RECALL_STORES", "")
 TOP_N = _env_int("MEMD_TOP_N", 8)
 TIMEOUT = _env_float("MEMD_TIMEOUT", 4.0)
 MAX_CHARS = _env_int("MEMD_MAX_CHARS", 14000)
@@ -382,37 +385,80 @@ def render(notes, top_n=DEFAULT_TOP_N, max_chars=DEFAULT_MAX_CHARS,
 _RECALL_ID = re.compile(r"^[0-9a-f]{16}$")
 
 
-def with_recall_id(block, recall_id, max_chars=None):
-    """Tell the agent which recall_id to pass to read(), so its reads improve ranking."""
+def with_recall_id(block, recall_id, max_chars=None, stores=None):
+    """Tell the agent which recall_id to pass to read(), so its reads improve ranking.
+
+    `stores` is the reply's list of stores searched: non-empty for a federated recall.
+    """
     max_chars = MAX_CHARS if max_chars is None else max_chars
     if not block or not isinstance(recall_id, str) or not _RECALL_ID.match(recall_id):
         return block
     footer = f'\n\n[To open a note from this recall: read(slug, recall_id="{recall_id}").]'
+    if isinstance(stores, list) and stores:
+        # read(slug) alone opens the caller's own store, not the one a note came from.
+        footer = (f'\n\n[To open a note from this recall: read(slug, recall_id="{recall_id}"); '
+                  'for a note marked [store], add store="<that store>".]')
     return block + footer if len(block) + len(footer) <= max_chars else block
+
+
+def _federation(value):
+    """Request fields for a MEMD_RECALL_STORES value; {} keeps the single-store request."""
+    value = (value or "").strip()
+    if value.lower() == "all":
+        return {"scope": "all"}
+    stores = list(dict.fromkeys(name.strip() for name in value.split(",") if name.strip()))
+    return {"stores": stores} if stores else {}
+
+
+def _post_recall(body, timeout):
+    headers = {"Content-Type": "application/json"}
+    if TOKEN:
+        headers["Authorization"] = f"Bearer {TOKEN}"
+    req = urllib.request.Request(
+        f"{REMOTE.rstrip('/')}/recall",
+        data=json.dumps(body).encode("utf-8"),
+        headers=headers,
+        method="POST",
+    )
+    with urllib.request.urlopen(req, timeout=timeout) as resp:
+        return json.loads(resp.read().decode("utf-8"))
 
 
 def fetch_recall(prompt):
     """Request canonical bounded context; tolerate older notes-only servers."""
     body = {"query": prompt, "profile": PROFILE, "k": TOP_N,
             "max_chars": MAX_CHARS, "format": "context"}
-    payload = json.dumps(body).encode("utf-8")
-    headers = {"Content-Type": "application/json"}
-    if TOKEN:
-        headers["Authorization"] = f"Bearer {TOKEN}"
-    req = urllib.request.Request(
-        f"{REMOTE.rstrip('/')}/recall",
-        data=payload,
-        headers=headers,
-        method="POST",
-    )
+    federation = _federation(RECALL_STORES)
+    refused = None
     try:
-        with urllib.request.urlopen(req, timeout=TIMEOUT) as resp:
-            data = json.loads(resp.read().decode("utf-8"))
+        if federation:
+            # The server answers 400 to profile together with stores/scope. Its
+            # deadline is set inside our timeout, so a slow store is skipped and
+            # named instead of costing the whole injection.
+            multi = {key: value for key, value in body.items() if key != "profile"}
+            multi.update(federation, deadline_ms=int(max(500, TIMEOUT * 1000 - 800)))
+            started = time.monotonic()
+            try:
+                data = _post_recall(multi, TIMEOUT)
+            except urllib.error.HTTPError as e:
+                # One refused store refuses the whole call. Show the hook's own
+                # store instead, within what is left of the one timeout.
+                remaining = TIMEOUT - (time.monotonic() - started)
+                if e.code not in (400, 403) or remaining < 1.0:
+                    raise
+                refused = e.code
+                data = _post_recall(body, remaining)
+        else:
+            data = _post_recall(body, TIMEOUT)
     except Exception as e:  # noqa: BLE001
         sys.stderr.write(f"memd-recall-hook: recall failed: {e}\n")
         return []
     if not isinstance(data, dict):
         return []
+    if refused and isinstance(data.get("context"), str) and data["context"]:
+        data["context"] = (
+            f"[memd: multi-store recall was refused (HTTP {refused}); showing {PROFILE} only. "
+            "Check MEMD_RECALL_STORES and the token's additional stores.]\n\n" + data["context"])
     return data
 
 
@@ -444,7 +490,8 @@ def main():
         else:
             notes = data.get("notes", []) if isinstance(data, dict) else []
             block = render(notes, top_n=TOP_N, max_chars=MAX_CHARS, query=prompt)
-        block = with_recall_id(block, data.get("recall_id") if isinstance(data, dict) else None)
+        reply = data if isinstance(data, dict) else {}
+        block = with_recall_id(block, reply.get("recall_id"), stores=reply.get("stores"))
         out = {"hookSpecificOutput": {
             "hookEventName": "UserPromptSubmit",
             "additionalContext": block,

@@ -87,6 +87,11 @@ def detail(slug):
 
 def change(action, data, *, subject):
     cfg = owner_config()
+    from memd import inbox
+    if inbox.review_policy(cfg.profile) == "four-eyes":
+        # An edit or a retraction here is written at once, by the owner alone.
+        raise inbox.PolicyRefusal("This store requires review, so a memory cannot be edited or retracted here. "
+                                  "A change has to be proposed and approved from another account.")
     allowed = {"slug", "revision"} | ({"title", "body", "description", "tags"} if action == "edit" else set())
     if action not in {"edit", "retract"} or set(data) - allowed:
         raise ValueError("Unsupported memory fields")

@@ -9,10 +9,11 @@ it as ``profile`` on an ordinary call, and every store is resolved separately:
 * **publish** copies one note from a store the caller may read (the source,
   default their own) into a store they may write (the target) through the
   target's normal save path, or its review inbox when the target has
-  ``publish_review`` on (the default) or agent saves are queued
-  (MEMD_SAVE_MODE=inbox). The copy carries ``published_from: {store, slug,
-  revision, by, at}``; publishing the same note again updates that copy (found
-  by its provenance, never by title), and an unchanged source is a no-op.
+  ``publish_review`` on (the default) or the caller's saves into it are queued
+  (the target's review policy, or MEMD_SAVE_MODE=inbox). The copy carries
+  ``published_from: {store, slug, revision, by, at}``; publishing the same note
+  again updates that copy (found by its provenance, never by title), and an
+  unchanged source is a no-op.
 * **federated recall** runs recall once per requested store (``stores`` list, or
   ``scope: "all"`` for every store the caller is granted), in parallel with a
   cap and one shared deadline, fuses the per-store rankings by reciprocal rank
@@ -47,6 +48,8 @@ import datetime
 import json
 import sqlite3
 import sys
+import threading
+import time
 from pathlib import Path
 
 TRAVELS = ("title", "body", "host", "tags", "importance", "description", "source",
@@ -54,9 +57,16 @@ TRAVELS = ("title", "body", "host", "tags", "importance", "description", "source
 NEVER_TRAVELS = ("saved_by", "pinned", "last_used", "superseded_by", "grounding", "profile",
                  "verification", "published_from")
 MAX_STORES = 16             # stores one federated recall may name or expand to
-FEDERATION_WORKERS = 4      # per-store recalls running at once
+FEDERATION_PER_CALL = 4     # stores one request recalls at once; its others start as these finish
+FEDERATION_STUCK_PER_STORE = 2   # given up at the server's own deadline; past this the store is busy
+FEDERATION_STUCK_PER_CALLER = 2  # given up at a deadline the caller shortened; past this, busy for that caller
+FEDERATION_STUCK_SHORTENED = 8   # given up at shortened deadlines, by anyone; past this, busy for those who shorten
 FEDERATION_SLACK_MS = 1500  # beyond the embed + rerank deadlines, for SQLite and Git
 RRF_K = 60
+_federation_lock = threading.Lock()
+# ("store", store), ("caller", caller key, store) or ("shortened", store)
+#   -> recalls still running after their request gave up
+_federation_stuck: dict[tuple, int] = {}
 
 
 # Set only by main(): the process is the local operator's CLI (see authorized_store).
@@ -381,9 +391,12 @@ def publish(slug: str, target_store: str, *, source_store: str | None = None,
     target_ref = {"store": target, "slug": fact["slug"]}
 
     from memd import inbox
-    if publish_review(target) or inbox.save_routes_to_inbox():
-        proposed = inbox.propose(fact, target, cfg=tgt_cfg, source="publish", proposer=get_actor(),
-                                 provenance=provenance)
+    # The target's review policy can hold a publish back even with publish_review off.
+    if publish_review(target) or inbox.save_routes_to_inbox(target):
+        from memd.actor import caller
+        who = caller()
+        proposed = inbox.propose(fact, target, cfg=tgt_cfg, source="publish", proposer=who.label,
+                                 provenance=provenance, caller=who)
         return {"ok": True, "action": "queued", "queued": True, "inbox_id": proposed["id"],
                 "duplicate": proposed.get("duplicate", False), "source": src_ref,
                 "target": {**target_ref, "revision": None}, "published_from": provenance,
@@ -457,10 +470,16 @@ def resolve_stores(stores=None, scope=None, *, operation: str = "recall") -> lis
     return readable_stores(operation)
 
 
-def deadline_ms() -> int:
-    """One budget for the whole federated recall: embed + rerank deadlines + slack."""
+def deadline_ms(requested: int | None = None) -> int:
+    """One budget for the whole federated recall: embed + rerank deadlines + slack.
+
+    `requested` is the caller's own ``deadline_ms``: it can only shorten the
+    budget, and not below 100 ms.
+    """
     from memd.config import Config
     from memd.profiles import effective_environment
+    if requested is not None:
+        return min(deadline_ms(), max(100, int(requested)))
     env = effective_environment()
     override = (env.get("MEMD_FEDERATED_DEADLINE_MS") or "").strip()
     if override:
@@ -472,9 +491,81 @@ def deadline_ms() -> int:
     return cfg.embed_deadline_ms + cfg.rerank_deadline_ms + FEDERATION_SLACK_MS
 
 
+def request_deadline_ms(requested: int | None = None) -> int:
+    """The budget for this request's federated recall.
+
+    The caller's ``deadline_ms`` shortens it (`deadline_ms`) only for a caller
+    with an account or a token. A remote caller with neither cannot be told
+    apart from another, so its recalls given up early could not be charged to it
+    (see `federate`): it gets the server's budget.
+    """
+    from memd import access
+    from memd.actor import caller
+    if requested is None:
+        return deadline_ms()
+    who = caller()
+    if access.remote_request.get() and not (who.account or who.credential):
+        return deadline_ms()
+    return deadline_ms(requested)
+
+
+def _caller_key() -> tuple:
+    """Who a recall given up at a shortened deadline is charged to.
+
+    An account across all its sessions and tokens, else the credential (a token
+    that is no one's account), else a local caller's label.
+    """
+    from memd.actor import caller
+    who = caller()
+    if who.account:
+        return ("account", who.account)
+    if who.credential:
+        return ("credential", who.credential)
+    return ("label", who.label)
+
+
 def _as_dict(note) -> dict:
     to_dict = getattr(note, "to_dict", None)
     return dict(to_dict()) if callable(to_dict) else dict(note)
+
+
+def _start(fn, *args) -> concurrent.futures.Future:
+    """Run ``fn(*args)`` on a new daemon thread and return a Future for its result.
+
+    A daemon thread never holds up the process's exit.
+    """
+    future = concurrent.futures.Future()
+    future.set_running_or_notify_cancel()
+
+    def target():
+        try:
+            value = fn(*args)
+        except BaseException as exc:
+            future.set_exception(exc)
+        else:
+            future.set_result(value)
+
+    threading.Thread(target=target, name="memd-federated", daemon=True).start()
+    return future
+
+
+def _busy(store: str, who: tuple, shortened: bool) -> bool:
+    """Whether another recall of the store would only add a thread.
+
+    It is, for everyone, when FEDERATION_STUCK_PER_STORE recalls given up at the
+    server's own deadline still run: the store is hung or far too slow. For a
+    request that shortened the deadline it also is when FEDERATION_STUCK_PER_CALLER
+    of its caller's recalls given up that way still run, or
+    FEDERATION_STUCK_SHORTENED of anyone's: those say nothing about the store, so
+    they never hold up a request that keeps the server's deadline, and the
+    threads they cost stay bounded however many callers shorten.
+    """
+    with _federation_lock:
+        if _federation_stuck.get(("store", store), 0) >= FEDERATION_STUCK_PER_STORE:
+            return True
+        return shortened and (
+            _federation_stuck.get(("caller", who, store), 0) >= FEDERATION_STUCK_PER_CALLER
+            or _federation_stuck.get(("shortened", store), 0) >= FEDERATION_STUCK_SHORTENED)
 
 
 def federate(stores: list[str], recall_one, *, k: int, budget_ms: int | None = None
@@ -486,27 +577,85 @@ def federate(stores: list[str], recall_one, *, k: int, budget_ms: int | None = N
     (1/(RRF_K + rank) within their own store, earlier store on a tie) and cut
     to `k`. A store that fails or misses the shared deadline is skipped and
     reported, never allowed to fail the others.
+
+    Each store runs on its own thread, at most FEDERATION_PER_CALL of this request's
+    at a time, the others started as those finish and never after the deadline. A
+    recall still running when the request gives up is left to finish and counted:
+    against its store when the server's own deadline ran out, against this caller
+    and the store when the caller had shortened it. Past a few such recalls the
+    store is skipped as busy (`_busy`) without starting another: for everyone when
+    the server's deadline ran out, for requests that shorten it otherwise. So a hung
+    store costs a bounded number of threads and slows no other store, and a short
+    deadline never makes a store busy for a request that keeps the server's.
     """
-    budget = deadline_ms() if budget_ms is None else budget_ms
+    server = deadline_ms()
+    budget = server if budget_ms is None else budget_ms
+    shortened = budget < server
+    who = _caller_key()
+    until = time.monotonic() + budget / 1000
     results: dict[str, list] = {}
-    skipped: list[dict] = []
-    pool = concurrent.futures.ThreadPoolExecutor(max_workers=max(1, min(FEDERATION_WORKERS, len(stores))),
-                                                 thread_name_prefix="memd-federated")
+    failed: dict[str, str] = {}
+    waiting = list(stores)          # not yet started, in order
+    futures: dict = {}              # future -> (store, entry)
+
+    def run(store, entry):
+        try:
+            return recall_one(store)
+        finally:
+            with _federation_lock:
+                entry["done"] = True
+                if entry["abandoned"]:
+                    for charge in entry["charges"]:
+                        count = _federation_stuck.get(charge, 0) - 1
+                        if count <= 0:
+                            _federation_stuck.pop(charge, None)
+                        else:
+                            _federation_stuck[charge] = count
+
     try:
-        # Each worker runs in a copy of the caller's context, so any code that
-        # consults the request's identity sees the same caller.
-        futures = {pool.submit(contextvars.copy_context().run, recall_one, store): store for store in stores}
-        done, _ = concurrent.futures.wait(futures, timeout=budget / 1000)
-        for future, store in futures.items():
-            if future not in done:
-                skipped.append({"store": store, "reason": "deadline"})
-                continue
-            try:
-                results[store] = list(future.result())
-            except Exception as exc:
-                skipped.append({"store": store, "reason": type(exc).__name__})
+        while True:
+            left = until - time.monotonic()
+            if left <= 0:
+                break
+            running = [f for f in futures if not f.done()]
+            room = FEDERATION_PER_CALL - len(running)
+            while room > 0 and waiting:
+                store = waiting.pop(0)
+                if _busy(store, who, shortened):
+                    failed[store] = "busy"
+                    continue
+                entry = {"done": False, "abandoned": False,
+                         "charges": (("caller", who, store), ("shortened", store)) if shortened
+                         else (("store", store),)}
+                try:
+                    # Each thread runs in a copy of the caller's context, so any code
+                    # that consults the request's identity sees the same caller.
+                    future = _start(contextvars.copy_context().run, run, store, entry)
+                except RuntimeError as exc:      # no thread could be started
+                    failed[store] = type(exc).__name__
+                    continue
+                futures[future] = (store, entry)
+                running.append(future)
+                room -= 1
+            if not running:
+                break
+            concurrent.futures.wait(running, timeout=left, return_when=concurrent.futures.FIRST_COMPLETED)
+        for future, (store, _) in futures.items():
+            if future.done():
+                try:
+                    results[store] = list(future.result())
+                except Exception as exc:
+                    failed[store] = type(exc).__name__
     finally:
-        pool.shutdown(wait=False, cancel_futures=True)
+        for future, (store, entry) in futures.items():
+            with _federation_lock:
+                if not entry["done"] and not entry["abandoned"]:
+                    entry["abandoned"] = True
+                    for charge in entry["charges"]:
+                        _federation_stuck[charge] = _federation_stuck.get(charge, 0) + 1
+
+    skipped = [{"store": s, "reason": failed.get(s, "deadline")} for s in stores if s not in results]
+
     core: list[dict] = []
     ranked: list[tuple[float, int, int, dict]] = []
     for order, store in enumerate(stores):
@@ -533,8 +682,13 @@ def federated_recall(args: dict, stores: list[str], recall_one, *, budget_ms: in
 
     `args` is memd.normalize.normalize_recall_args output; ``recall_one(store,
     query, k, **filters)`` runs one ordinary single-store recall.
+
+    The rendered text stays within max_chars including its two additions: for a
+    present-state query, the current-facts block of the first store (when that
+    store was searched), and one closing line naming every skipped store.
     """
-    from memd.render import render_result
+    from memd.recall import CURRENT_INTENT
+    from memd.render import DEFAULT_MAX_CHARS, _number, render_result
     kw = {} if args.get("include_core", True) else {"include_core": False}
     for key in ("host", "tags", "include_archived"):
         if args.get(key):
@@ -543,9 +697,26 @@ def federated_recall(args: dict, stores: list[str], recall_one, *, budget_ms: in
     notes, skipped = federate(stores, lambda store: recall_one(store, query, k, **kw), k=k,
                               budget_ms=budget_ms)
     annotate_upstream(notes, operation="recall")
-    shaped = render_result(notes, top_n=k, max_chars=args.get("max_chars", 14000), query=query,
-                           core_limit=args.get("core_limit"), include_core=args.get("include_core", True))
     missed = {row["store"] for row in skipped}
+    budget = _number(args.get("max_chars", 14000), DEFAULT_MAX_CHARS, 256, 100000)
+    closing = ""
+    if skipped:
+        closing = "[Stores not searched: " + ", ".join(f"{row['store']} ({row['reason']})" for row in skipped) + ".]"
+    # The notes and the facts block share what the closing line leaves.
+    room = budget - len(closing) - 2 if closing else budget
+    shaped = render_result(notes, top_n=k, max_chars=room, query=query,
+                           core_limit=args.get("core_limit"), include_core=args.get("include_core", True))
+    if query and CURRENT_INTENT.search(query) and room >= 256 and stores and stores[0] not in missed:
+        try:
+            from memd.facts import append_current_facts
+            append_current_facts(shaped, query=query, db_path=_paths(stores[0])[2], max_chars=room,
+                                 store=stores[0])
+        except Exception:
+            pass    # the facts block is optional; recall itself already succeeded
+    if closing:
+        # Rendering never budgets below 256 characters, so a smaller room is cut to fit here.
+        text = (shaped.get("text") or "")[:max(0, room)].rstrip()
+        shaped["text"] = (f"{text}\n\n{closing}" if text else closing)[:budget]
     return {"notes": notes, "shaped": shaped, "stores": [s for s in stores if s not in missed],
             "stores_skipped": skipped}
 

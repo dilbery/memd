@@ -23,4 +23,4 @@ def test_sqlite_vec_loads():
 
 
 def test_package_version():
-    assert memd.__version__ == "0.1.0"
+    assert memd.__version__ == "0.2.0"

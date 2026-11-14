@@ -11,6 +11,7 @@
   <script src="/ui/assets/admin.js" defer></script>
   <script src="/ui/assets/health.js" defer></script>
   <script src="/ui/assets/entities.js" defer></script>
+  <script src="/ui/assets/inbox.js" defer></script>
 </head>
 <body>
   <a class="skip" href="#main">Skip to content</a>
@@ -22,6 +23,7 @@
     <a href="#memory" id="tab-memory" aria-current="page">Memory index</a>
     <a href="#health" id="tab-health">Memory health</a>
     <a href="#entities" id="tab-entities">Entities</a>
+    <a href="#inbox" id="tab-inbox" hidden>Inbox</a>
     <a href="#onboarding" id="tab-onboarding">Onboarding</a>
     <a href="#settings" id="tab-settings" hidden>Settings</a>
     <a href="#admin" id="tab-admin" hidden>Administration</a>
@@ -77,6 +79,39 @@
         <div id="entity-sections" class="health-lists"></div>
       </article>
     </section>
+    <section id="inbox-panel" aria-labelledby="inbox-title" hidden>
+      <div class="page-heading"><div><p class="eyebrow">NOTHING IS SAVED UNTIL IT IS APPROVED</p><h1 id="inbox-title" tabindex="-1">Inbox</h1><p class="muted">Memories waiting for review in the stores you review. Approve or reject each one before it is written.</p></div><button id="inbox-refresh" class="secondary">Refresh</button></div>
+      <p id="inbox-policy" class="notice" hidden>In this store a candidate is decided by someone other than the account that proposed it, and only its tags and importance can be changed.</p>
+      <div id="inbox-error" class="notice error" role="alert" hidden></div>
+      <div id="inbox-message" class="notice" role="status" hidden></div>
+      <div id="inbox-list-view">
+        <div class="section-heading"><p id="inbox-meta" class="small muted" aria-live="polite"></p><div id="inbox-filter" class="inbox-filter"><label id="inbox-store-field" class="heat-group small muted" hidden>Store <select id="inbox-store"></select></label><label class="heat-group small muted">Show <select id="inbox-status"><option value="pending">Waiting for review</option><option value="approved">Approved</option><option value="rejected">Rejected</option></select></label></div></div>
+        <ul id="inbox-list" class="entity-list" aria-busy="false"></ul>
+        <div class="pagination" id="inbox-pagination" hidden><button id="inbox-previous" class="secondary">← Previous</button><span id="inbox-page-label" class="muted small" aria-live="polite"></span><button id="inbox-next" class="secondary">Next →</button></div>
+      </div>
+      <article id="inbox-view" aria-labelledby="inbox-candidate-title" aria-busy="false" hidden>
+        <a href="#inbox" class="back-link">← All candidates</a>
+        <div class="entity-head"><h2 id="inbox-candidate-title" tabindex="-1">Loading…</h2><span id="inbox-candidate-status" class="chip"></span></div>
+        <p id="inbox-candidate-meta" class="small muted"></p>
+        <p id="inbox-decided" class="notice" hidden></p>
+        <div id="inbox-candidate" hidden>
+          <div class="health-lists">
+            <section class="panel health-list" aria-labelledby="inbox-lint-title"><h2 id="inbox-lint-title">If approved</h2><p id="inbox-lint-action" class="small muted"></p><ul id="inbox-lint-items" class="health-items"></ul></section>
+            <section class="panel health-list" aria-labelledby="inbox-details-title"><h2 id="inbox-details-title">Proposed details</h2><dl id="inbox-details" class="inbox-details"></dl></section>
+          </div>
+          <form id="inbox-review-form" class="panel form-grid inbox-review">
+            <label>Title<input id="inbox-field-title" maxlength="500" required autocomplete="off"></label>
+            <label>Summary (optional)<input id="inbox-field-description" maxlength="1000" autocomplete="off"></label>
+            <label>Memory<textarea id="inbox-field-body" rows="12" maxlength="200000" required></textarea></label>
+            <p id="inbox-text-help" class="small muted" hidden>Changing the title, summary or memory text needs write access to this store. You can still set the tags and importance.</p>
+            <p id="inbox-text-policy" class="small muted" hidden>This store keeps the title, summary and memory text as they were proposed. You can still set the tags and importance; to have the text corrected, reject the candidate with a reason.</p>
+            <div class="form-columns"><label>Tags (comma-separated)<input id="inbox-field-tags" maxlength="2430" autocomplete="off" spellcheck="false"></label><label>Importance<select id="inbox-field-importance"><option value="1">1 · minor</option><option value="2">2</option><option value="3">3 · normal</option><option value="4">4 · core</option><option value="5">5 · essential</option></select></label></div>
+            <div id="inbox-review-error" class="notice error" role="alert" hidden></div>
+            <div id="inbox-actions" class="action-row"><button id="inbox-approve">Approve and save</button><button id="inbox-reject" type="button" class="secondary danger">Reject</button></div>
+          </form>
+        </div>
+      </article>
+    </section>
     <section id="onboarding-panel" aria-labelledby="onboarding-title" hidden>
       <div class="page-heading"><div><p class="eyebrow">BRING YOUR CONTEXT WITH YOU</p><h1 id="onboarding-title">Connect an agent</h1><p class="muted">One memory service. The same context on every machine.</p></div><span class="badge">Quick start</span></div>
       <div class="onboarding-grid"><div class="steps">
@@ -112,14 +147,21 @@
     <div id="vault-fields" class="form-grid" hidden><label>Vault folder on the server<input id="store-vault" placeholder="/vaults/my-notes"></label><label>Folder for agent memories<input id="store-write-folder" value="Memories"></label><p class="small muted">Mount the vault under an allowed server vault root first. Existing notes are imported read-only; agents write only to the selected memory folder.</p></div>
     <div class="form-columns"><label>Include patterns (one per line)<textarea id="store-include" rows="3">**/*.md</textarea></label><label>Exclude patterns (one per line)<textarea id="store-exclude" rows="3" placeholder="Private/**"></textarea></label></div>
     <label>Automatic sync interval (seconds; 0 = manual)<input id="store-interval" type="number" min="0" max="86400" value="300"></label>
-    <div class="check-field"><label class="check"><input id="store-publish-review" type="checkbox" checked aria-describedby="store-publish-review-help">Published notes need review</label><p id="store-publish-review-help" class="small muted">Notes that members publish into this store from another store wait in its review inbox until someone with write access approves them. Clear this to save published notes directly.</p></div>
+    <fieldset id="store-review" class="extra-stores review-policy"><legend>Review</legend>
+      <div class="check-field"><label class="check"><input id="store-review-open" type="radio" name="review-policy" value="open" checked aria-describedby="store-review-open-help">No review</label><p id="store-review-open-help" class="small muted">Saves are written directly, unless the instance queues agent saves.</p></div>
+      <div class="check-field"><label class="check"><input id="store-review-agents" type="radio" name="review-policy" value="agents" aria-describedby="store-review-agents-help">Agent saves need review</label><p id="store-review-agents-help" class="small muted">Saves from agent tokens wait in this store’s inbox.</p></div>
+      <div class="check-field"><label class="check"><input id="store-review-four-eyes" type="radio" name="review-policy" value="four-eyes" aria-describedby="store-review-four-eyes-help">All saves need review by someone else</label><p id="store-review-four-eyes-help" class="small muted">Every save and publish waits. The account that proposed it cannot approve or reject it, and reviewers cannot change its text.</p></div>
+      <div id="store-review-notes" role="status"><p id="store-review-few" class="notice" hidden></p><p id="store-review-unreviewed" class="notice" hidden>Notes that arrive through this store’s Git repository or Obsidian vault are not reviewed. The rule covers what is saved or published through memd.</p></div>
+    </fieldset>
+    <div class="check-field"><label class="check"><input id="store-publish-review" type="checkbox" checked aria-describedby="store-publish-review-help">Published notes need review</label><p id="store-publish-review-help" class="small muted">Notes that members publish into this store from another store wait in its review inbox until someone with review access approves them. Clear this to save published notes directly, unless every save into this store needs review (below).</p></div>
     <details><summary>Search services</summary><div class="form-grid"><p class="small muted">Leave blank to use server defaults. Embeddings must be 768-dimensional. Use a new store when changing embedding models for an existing index.</p><label>Embedding service URL<input id="store-embed-url" placeholder="http://embed:8080"></label><label>Embedding model<input id="store-embed-model"></label><label>Reranker service URL<input id="store-rerank-url"></label><label>Reranker model<input id="store-rerank-model"></label></div></details>
     <div id="store-error" class="notice error" role="alert" hidden></div><button id="store-submit">Save store</button>
   </form></dialog>
   <dialog id="user-dialog" aria-labelledby="user-title"><div class="reader-top"><h2 id="user-title">Add user</h2><button class="quiet" data-close="user-dialog">Close ×</button></div><form id="user-form" class="form-grid"><label>Username<input id="user-name" pattern="[a-z][a-z0-9-]{0,47}" required></label><label>Role<select id="user-role"><option value="member">Member</option><option value="admin">Administrator</option></select></label><p class="small muted">A temporary password is generated once. Grant memory store access after creating the account.</p><div id="user-error" class="notice error" role="alert" hidden></div><button>Add user</button></form></dialog>
   <dialog id="grants-dialog" aria-labelledby="grants-title"><div class="reader-top"><h2 id="grants-title">Store access</h2><button class="quiet" data-close="grants-dialog">Close ×</button></div><form id="grants-form" class="form-grid"><div id="grant-fields"></div><div id="grants-error" class="notice error" role="alert" hidden></div><button>Save access</button></form></dialog>
-  <dialog id="token-dialog" aria-labelledby="token-title"><div class="reader-top"><h2 id="token-title">Issue access token</h2><button class="quiet" data-close="token-dialog">Close ×</button></div><form id="token-form" class="form-grid"><label>Token name<input id="token-name" required maxlength="100" placeholder="laptop-agent"></label><label>Owner<select id="token-user"></select></label><label>Memory store<select id="token-store"></select></label><label>Access<select id="token-scope"><option value="read">Read only</option><option value="write">Read and write</option></select></label><fieldset class="extra-stores" aria-describedby="token-extra-help"><legend>Additional stores (optional)</legend><p id="token-extra-help" class="small muted">Lets this token also recall from, read or publish into other stores. Only stores the owner can access are listed, and the owner’s current access is checked again on every request.</p><div id="token-extra"></div></fieldset><label>Expires after<select id="token-expiry"><option value="90">90 days</option><option value="30">30 days</option><option value="365">1 year</option><option value="0">No expiry</option></select></label><div id="token-error" class="notice error" role="alert" hidden></div><button>Issue token</button></form></dialog>
+  <dialog id="token-dialog" aria-labelledby="token-title"><div class="reader-top"><h2 id="token-title">Issue access token</h2><button class="quiet" data-close="token-dialog">Close ×</button></div><form id="token-form" class="form-grid"><label>Token name<input id="token-name" required maxlength="100" placeholder="laptop-agent"></label><label>Owner<select id="token-user"></select></label><label>Memory store<select id="token-store"></select></label><label>Access<select id="token-scope"><option value="read">Read only</option><option value="write">Read and write</option></select></label><fieldset class="extra-stores" aria-describedby="token-extra-help"><legend>Additional stores (optional)</legend><p id="token-extra-help" class="small muted">Lets this token also recall from, read or publish into other stores. Only stores the owner can access are listed, and the owner’s current access is checked again on every request.</p><div id="token-extra"></div></fieldset><div class="check-field"><label class="check"><input id="token-review" type="checkbox" aria-describedby="token-review-help">May review inbox candidates</label><p id="token-review-help" class="small muted">Lets this token approve or reject candidates in the stores where its owner can review. It cannot decide its own proposals, and it may change only tags and importance.</p></div><label>Expires after<select id="token-expiry"><option value="90">90 days</option><option value="30">30 days</option><option value="365">1 year</option><option value="0">No expiry</option></select></label><div id="token-error" class="notice error" role="alert" hidden></div><button>Issue token</button></form></dialog>
   <dialog id="conflicts-dialog" aria-labelledby="conflicts-title"><div class="reader-top"><h2 id="conflicts-title">Resolve vault conflicts</h2><button class="quiet" data-close="conflicts-dialog">Close ×</button></div><p class="small muted">Compare both copies, then choose which to keep. Both versions are archived on the server before resolution.</p><div id="conflicts-error" class="notice error" role="alert" hidden></div><div id="conflicts-list"></div></dialog>
+  <dialog id="inbox-reject-dialog" aria-labelledby="inbox-reject-title"><div class="reader-top"><h2 id="inbox-reject-title">Reject this candidate?</h2><button type="button" class="quiet" data-close="inbox-reject-dialog">Close ×</button></div><p id="inbox-reject-name"></p><p class="small muted">Nothing is written to the store. The candidate stays in the Rejected list with your reason.</p><form id="inbox-reject-form" class="form-grid"><label>Reason (optional)<input id="inbox-reject-reason" maxlength="1000" autocomplete="off"></label><div id="inbox-reject-error" class="notice error" role="alert" hidden></div><button id="inbox-reject-submit">Reject candidate</button></form></dialog>
   <dialog id="secret-dialog" aria-labelledby="secret-title"><div class="reader-top"><h2 id="secret-title">Save this credential</h2><button class="quiet" data-close="secret-dialog">Done</button></div><p id="secret-description" class="muted"></p><div class="code-block"><pre><code id="new-secret"></code></pre><button id="secret-copy" class="copy quiet">Copy</button></div><p class="small muted">This value is shown once. It will not appear in the account or token list.</p></dialog>
   <noscript><p class="notice">JavaScript is needed for the memory index. <a href="/help">Open the setup reference</a>.</p></noscript>
 </body>

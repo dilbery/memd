@@ -18,13 +18,33 @@ const MEMD_TOKEN = process.env.MEMD_TOKEN;
 // Personal tokens select their own store. Keep an explicit profile only for
 // older single-store deployments which still configure one.
 const MEMD_PROFILE = process.env.MEMD_PROFILE;
+// Unset: recall from the token's own store. "all" or "amber,team": recall across
+// stores the token was issued to reach.
+const MEMD_RECALL_STORES = (process.env.MEMD_RECALL_STORES ?? "").trim();
 const MEMD_RECALL_K = Number(process.env.MEMD_RECALL_K ?? 8);
 const MEMD_MAX_CHARS = Number(process.env.MEMD_MAX_CHARS ?? 14000) || 14000;
+const RECALL_TIMEOUT_MS = 5000;
 
 function authHeaders(): Record<string, string> {
   const h: Record<string, string> = { "Content-Type": "application/json" };
   if (MEMD_TOKEN) h.Authorization = `Bearer ${MEMD_TOKEN}`;
   return h;
+}
+
+// Request fields for MEMD_RECALL_STORES; null keeps the single-store request.
+function recallFederation(): Record<string, unknown> | null {
+  if (MEMD_RECALL_STORES.toLowerCase() === "all") return { scope: "all" };
+  const stores = [...new Set(MEMD_RECALL_STORES.split(",").map((s) => s.trim()).filter(Boolean))];
+  return stores.length ? { stores } : null;
+}
+
+function postRecall(body: Record<string, unknown>, timeoutMs: number) {
+  return fetch(`${MEMD_URL}/recall`, {
+    method: "POST",
+    headers: authHeaders(),
+    signal: AbortSignal.timeout(timeoutMs),
+    body: JSON.stringify(body),
+  });
 }
 
 function truncate(text: string, max: number): string {
@@ -37,18 +57,38 @@ export default function (pi: ExtensionAPI) {
     if (prompt.length < 3) return;
 
     try {
-      const res = await fetch(`${MEMD_URL}/recall`, {
-        method: "POST",
-        headers: authHeaders(),
-        signal: AbortSignal.timeout(5000),
-        body: JSON.stringify({ query: prompt, profile: MEMD_PROFILE, k: MEMD_RECALL_K,
-                               format: "context", max_chars: MEMD_MAX_CHARS }),
-      });
+      const single = { query: prompt, profile: MEMD_PROFILE, k: MEMD_RECALL_K,
+                       format: "context", max_chars: MEMD_MAX_CHARS };
+      const federation = recallFederation();
+      const started = performance.now();
+      // The server answers 400 to profile together with stores/scope. Its deadline
+      // is set inside our timeout, so a slow store is skipped instead of costing
+      // the whole injection.
+      let res = await postRecall(
+        federation
+          ? { ...single, profile: undefined, ...federation, deadline_ms: RECALL_TIMEOUT_MS - 800 }
+          : single,
+        RECALL_TIMEOUT_MS,
+      );
+      let refused = 0;
+      if (federation && (res.status === 403 || res.status === 400)) {
+        // One refused store refuses the whole call. Show the token's own store
+        // instead, within what is left of the one timeout.
+        const remaining = Math.floor(RECALL_TIMEOUT_MS - (performance.now() - started));
+        if (remaining < 1000) return;
+        refused = res.status;
+        res = await postRecall(single, remaining);
+      }
       if (!res.ok) return;
       const data: any = await res.json();
       if (typeof data?.context === "string") {
         if (!data.context) return;
-        return { message: { customType: "memd-recall", content: data.context, display: false } };
+        const shown = MEMD_PROFILE || (typeof data.profile === "string" && data.profile) || "your own store";
+        const notice = refused
+          ? `[memd: multi-store recall was refused (HTTP ${refused}); showing ${shown} only. ` +
+            "Check MEMD_RECALL_STORES and the token's additional stores.]\n\n"
+          : "";
+        return { message: { customType: "memd-recall", content: notice + data.context, display: false } };
       }
       const notes: any[] = Array.isArray(data?.notes) ? data.notes : [];
 
