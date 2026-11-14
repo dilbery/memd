@@ -981,7 +981,7 @@ def create_token_app() -> FastAPI:
 
         def one(store, query, k, **kw):
             return _core_recall(query, profile=store, k=k, **kw)
-        out = share.federated_recall(args, stores, one, budget_ms=share.deadline_ms(args.get("deadline_ms")))
+        out = share.federated_recall(args, stores, one, budget_ms=share.request_deadline_ms(args.get("deadline_ms")))
         shaped = out["shaped"]
         context = shaped.pop("text")
         control.audit_read("recall.federated", ",".join(map(str, stores))[:200])

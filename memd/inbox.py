@@ -314,11 +314,17 @@ def _own_proposal(row: sqlite3.Row, reviewer: Reviewer) -> bool:
 
     Labels are not unique, so ids decide. A candidate without them was filed by
     a local caller or before ids were recorded: the label is all there is.
-    Rotation keeps a token the proposer of its predecessors' candidates.
+    Every token of one rotation tree is the same proposer: during the overlap
+    the holder has both the old token and the new. A registry that cannot be
+    read refuses the decision instead of narrowing who the proposer is.
     """
-    from memd.registry import lineage
+    from memd.registry import ControlError, rotation_family
     if row["proposer_credential"]:
-        return row["proposer_credential"] in lineage(reviewer.credential)
+        try:
+            return row["proposer_credential"] in rotation_family(reviewer.credential)
+        except ControlError:
+            raise PolicyRefusal("The token's rotation history could not be read, so this candidate cannot be "
+                                "shown to be another's. Try again.") from None
     return row["proposer"] == reviewer.label
 
 
@@ -529,7 +535,7 @@ def propose(payload: dict, profile: str, *, cfg, source: str = "agent", proposer
                  json.dumps(provenance, sort_keys=True) if provenance else None, account, credential))
             if handoff_repo is not None:
                 handoff.replace_pending(conn, handoff_repo, (proposer or "")[:200], cid,
-                                        account=account, credential=credential)
+                                        account=account, credentials=own.get("proposer_credential") or ())
     finally:
         conn.close()
     return {"ok": True, "proposed": True, "duplicate": False, "id": cid, "status": "pending",

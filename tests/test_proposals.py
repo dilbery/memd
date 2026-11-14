@@ -725,6 +725,42 @@ def test_a_rotated_registry_token_keeps_its_proposals_and_still_cannot_approve_t
         assert inbox._own_proposal(row, reviewer) is expected
 
 
+def test_every_token_of_a_rotation_is_one_proposer_and_an_unreadable_registry_refuses(store, tmp_path, monkeypatch):
+    import sqlite3
+    monkeypatch.setenv("MEMD_CONTROL_DB", str(tmp_path / "control" / "control.db"))
+    tokens = registry.Registry()
+    tokens.initialize()
+
+    def issue():
+        return tokens.issue(actor="operator", operation_id=str(uuid.uuid4()), label="shared",
+                            owner="team", purpose="agents", stores=["amber"], operations=["read", "save"])
+
+    def rotate(made):
+        return tokens.rotate(made["token"]["id"], actor="operator", operation_id=str(uuid.uuid4()),
+                             revision=made["token"]["revision"], overlap_hours=24)
+    made, other = issue(), issue()
+    rotated = rotate(made)
+    again = rotate(rotated)
+    family = frozenset(t["token"]["id"] for t in (made, rotated, again))
+    for t in (made, rotated, again):
+        assert registry.rotation_family(t["token"]["id"]) == family
+    assert registry.rotation_family(other["token"]["id"]) == {other["token"]["id"]}
+    # The newest token filed it. The older ones are still active during the overlap, and decide nothing of it.
+    row = {"proposer_credential": again["token"]["id"], "proposer": "shared"}
+    for t, expected in ((made, True), (rotated, True), (again, True), (other, False)):
+        reviewer = inbox._reviewer("shared", credential=t["token"]["id"], is_token=True, store="amber")
+        assert inbox._own_proposal(row, reviewer) is expected
+    # A registry that cannot be read refuses the decision; reading back one's own only narrows.
+
+    def unreadable(self, *, write=False):
+        raise sqlite3.OperationalError("database is locked")
+    monkeypatch.setattr(registry.Registry, "connection", unreadable)
+    reviewer = inbox._reviewer("shared", credential=other["token"]["id"], is_token=True, store="amber")
+    with pytest.raises(inbox.PolicyRefusal, match="rotation history"):
+        inbox._own_proposal(row, reviewer)
+    assert registry.lineage(again["token"]["id"]) == (again["token"]["id"],)
+
+
 def test_a_full_inbox_refuses_before_reading_the_pending_texts(store, monkeypatch):
     monkeypatch.setattr(inbox, "MAX_PENDING", 2)
     inbox.propose(dict(FIRST), "amber", cfg=store, proposer="mem-import", precomputed_lint={})

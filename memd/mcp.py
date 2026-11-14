@@ -538,11 +538,11 @@ def _federation(arguments: dict) -> list[str] | None:
 
 
 def _federated_recall(args: dict, stores: list[str]) -> types.CallToolResult:
-    from memd.share import deadline_ms, federated_recall
+    from memd.share import federated_recall, request_deadline_ms
 
     def one(store, query, k, **kw):
         return _core_recall(query, profile=store, k=k, cfg=_cfg_for(store), **kw)
-    out = federated_recall(args, stores, one, budget_ms=deadline_ms(args.get("deadline_ms")))
+    out = federated_recall(args, stores, one, budget_ms=request_deadline_ms(args.get("deadline_ms")))
     shaped = out["shaped"]
     shaped["text"] = shaped.get("text") or "No matching memory notes."
     # One recall_id, logged in each store's usage log with that store's matches.

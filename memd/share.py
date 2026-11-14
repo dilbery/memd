@@ -57,14 +57,16 @@ TRAVELS = ("title", "body", "host", "tags", "importance", "description", "source
 NEVER_TRAVELS = ("saved_by", "pinned", "last_used", "superseded_by", "grounding", "profile",
                  "verification", "published_from")
 MAX_STORES = 16             # stores one federated recall may name or expand to
-FEDERATION_WORKERS = 16     # per-store recalls running at once in the process, abandoned ones included
-FEDERATION_PER_CALLER = 4   # of those, held at once by one caller's recalls; its other stores wait their turn
+FEDERATION_PER_CALL = 4     # stores one request recalls at once; its others start as these finish
+FEDERATION_STUCK_PER_STORE = 2   # given up at the server's own deadline; past this the store is busy
+FEDERATION_STUCK_PER_CALLER = 2  # given up at a deadline the caller shortened; past this, busy for that caller
+FEDERATION_STUCK_SHORTENED = 8   # given up at shortened deadlines, by anyone; past this, busy for those who shorten
 FEDERATION_SLACK_MS = 1500  # beyond the embed + rerank deadlines, for SQLite and Git
 RRF_K = 60
-_federation_pool: concurrent.futures.ThreadPoolExecutor | None = None
 _federation_lock = threading.Lock()
-_federation_freed = threading.Condition(_federation_lock)   # notified when a caller's place is given back
-_federation_held: dict[tuple, int] = {}     # caller key -> threads its recalls hold or wait for
+# ("store", store), ("caller", caller key, store) or ("shortened", store)
+#   -> recalls still running after their request gave up
+_federation_stuck: dict[tuple, int] = {}
 
 
 # Set only by main(): the process is the local operator's CLI (see authorized_store).
@@ -489,32 +491,26 @@ def deadline_ms(requested: int | None = None) -> int:
     return cfg.embed_deadline_ms + cfg.rerank_deadline_ms + FEDERATION_SLACK_MS
 
 
-def _as_dict(note) -> dict:
-    to_dict = getattr(note, "to_dict", None)
-    return dict(to_dict()) if callable(to_dict) else dict(note)
+def request_deadline_ms(requested: int | None = None) -> int:
+    """The budget for this request's federated recall.
 
-
-def _pool() -> concurrent.futures.ThreadPoolExecutor:
-    """The process-wide pool for federated recalls.
-
-    Created on first use, never at import, so a forked server process does not
-    inherit a pool without threads. Shared so that a recall that missed its
-    deadline keeps one of a fixed number of threads, bounding the total number
-    of running per-store recalls regardless of how many requests pile up.
+    The caller's ``deadline_ms`` shortens it (`deadline_ms`) only for a caller
+    with an account or a token. A remote caller with neither cannot be told
+    apart from another, so its recalls given up early could not be charged to it
+    (see `federate`): it gets the server's budget.
     """
-    global _federation_pool
-    if _federation_pool is None:
-        with _federation_lock:
-            if _federation_pool is None:
-                _federation_pool = concurrent.futures.ThreadPoolExecutor(
-                    max_workers=FEDERATION_WORKERS,
-                    thread_name_prefix="memd-federated",
-                )
-    return _federation_pool
+    from memd import access
+    from memd.actor import caller
+    if requested is None:
+        return deadline_ms()
+    who = caller()
+    if access.remote_request.get() and not (who.account or who.credential):
+        return deadline_ms()
+    return deadline_ms(requested)
 
 
 def _caller_key() -> tuple:
-    """Who the per-caller cap counts against.
+    """Who a recall given up at a shortened deadline is charged to.
 
     An account across all its sessions and tokens, else the credential (a token
     that is no one's account), else a local caller's label.
@@ -528,15 +524,48 @@ def _caller_key() -> tuple:
     return ("label", who.label)
 
 
-def _release(key: tuple) -> None:
-    """Give one of the caller's places back and wake the requests waiting for one."""
-    with _federation_freed:
-        remaining = _federation_held.get(key, 0) - 1
-        if remaining <= 0:
-            _federation_held.pop(key, None)
+def _as_dict(note) -> dict:
+    to_dict = getattr(note, "to_dict", None)
+    return dict(to_dict()) if callable(to_dict) else dict(note)
+
+
+def _start(fn, *args) -> concurrent.futures.Future:
+    """Run ``fn(*args)`` on a new daemon thread and return a Future for its result.
+
+    A daemon thread never holds up the process's exit.
+    """
+    future = concurrent.futures.Future()
+    future.set_running_or_notify_cancel()
+
+    def target():
+        try:
+            value = fn(*args)
+        except BaseException as exc:
+            future.set_exception(exc)
         else:
-            _federation_held[key] = remaining
-        _federation_freed.notify_all()
+            future.set_result(value)
+
+    threading.Thread(target=target, name="memd-federated", daemon=True).start()
+    return future
+
+
+def _busy(store: str, who: tuple, shortened: bool) -> bool:
+    """Whether another recall of the store would only add a thread.
+
+    It is, for everyone, when FEDERATION_STUCK_PER_STORE recalls given up at the
+    server's own deadline still run: the store is hung or far too slow. For a
+    request that shortened the deadline it also is when FEDERATION_STUCK_PER_CALLER
+    of its caller's recalls given up that way still run, or
+    FEDERATION_STUCK_SHORTENED of anyone's: those say nothing about the store, so
+    they never hold up a request that keeps the server's deadline, and the
+    threads they cost stay bounded however many callers shorten.
+    """
+    with _federation_lock:
+        if _federation_stuck.get(("store", store), 0) >= FEDERATION_STUCK_PER_STORE:
+            return True
+        return shortened and (
+            _federation_stuck.get(("caller", who, store), 0) >= FEDERATION_STUCK_PER_CALLER
+            or _federation_stuck.get(("shortened", store), 0) >= FEDERATION_STUCK_SHORTENED)
 
 
 def federate(stores: list[str], recall_one, *, k: int, budget_ms: int | None = None
@@ -549,63 +578,81 @@ def federate(stores: list[str], recall_one, *, k: int, budget_ms: int | None = N
     to `k`. A store that fails or misses the shared deadline is skipped and
     reported, never allowed to fail the others.
 
-    The stores run on the process's shared pool (`_pool`), at most
-    FEDERATION_PER_CALLER of one caller's at a time, the rest submitted as
-    places free; a recall abandoned at the deadline keeps its place until it ends.
+    Each store runs on its own thread, at most FEDERATION_PER_CALL of this request's
+    at a time, the others started as those finish and never after the deadline. A
+    recall still running when the request gives up is left to finish and counted:
+    against its store when the server's own deadline ran out, against this caller
+    and the store when the caller had shortened it. Past a few such recalls the
+    store is skipped as busy (`_busy`) without starting another: for everyone when
+    the server's deadline ran out, for requests that shorten it otherwise. So a hung
+    store costs a bounded number of threads and slows no other store, and a short
+    deadline never makes a store busy for a request that keeps the server's.
     """
-    budget = deadline_ms() if budget_ms is None else budget_ms
+    server = deadline_ms()
+    budget = server if budget_ms is None else budget_ms
+    shortened = budget < server
+    who = _caller_key()
     until = time.monotonic() + budget / 1000
-    key = _caller_key()
     results: dict[str, list] = {}
     failed: dict[str, str] = {}
-    waiting = list(stores)                 # not yet submitted, in order
-    futures: dict = {}                     # future -> store
+    waiting = list(stores)          # not yet started, in order
+    futures: dict = {}              # future -> (store, entry)
 
-    def run(store):
+    def run(store, entry):
         try:
             return recall_one(store)
         finally:
-            _release(key)
+            with _federation_lock:
+                entry["done"] = True
+                if entry["abandoned"]:
+                    for charge in entry["charges"]:
+                        count = _federation_stuck.get(charge, 0) - 1
+                        if count <= 0:
+                            _federation_stuck.pop(charge, None)
+                        else:
+                            _federation_stuck[charge] = count
 
     try:
         while True:
-            with _federation_lock:
-                room = max(0, FEDERATION_PER_CALLER - _federation_held.get(key, 0))
-                batch = waiting[:room]
-                if batch:
-                    _federation_held[key] = _federation_held.get(key, 0) + len(batch)
-            del waiting[:len(batch)]
-            for i, store in enumerate(batch):
-                try:
-                    # Each worker runs in a copy of the caller's context, so any code
-                    # that consults the request's identity sees the same caller.
-                    futures[_pool().submit(contextvars.copy_context().run, run, store)] = store
-                except BaseException:
-                    for _ in batch[i:]:
-                        _release(key)
-                    raise
-            running = [f for f in futures if not f.done()]
             left = until - time.monotonic()
-            if left <= 0 or not (waiting or running):
+            if left <= 0:
                 break
-            if running:
-                concurrent.futures.wait(running, timeout=left,
-                                        return_when=concurrent.futures.FIRST_COMPLETED)
-            else:
-                # The caller's other requests hold its share: wait for a place.
-                with _federation_freed:
-                    if _federation_held.get(key, 0) >= FEDERATION_PER_CALLER:
-                        _federation_freed.wait(timeout=left)
-        for future, store in futures.items():
-            if future.done() and not future.cancelled():
+            running = [f for f in futures if not f.done()]
+            room = FEDERATION_PER_CALL - len(running)
+            while room > 0 and waiting:
+                store = waiting.pop(0)
+                if _busy(store, who, shortened):
+                    failed[store] = "busy"
+                    continue
+                entry = {"done": False, "abandoned": False,
+                         "charges": (("caller", who, store), ("shortened", store)) if shortened
+                         else (("store", store),)}
+                try:
+                    # Each thread runs in a copy of the caller's context, so any code
+                    # that consults the request's identity sees the same caller.
+                    future = _start(contextvars.copy_context().run, run, store, entry)
+                except RuntimeError as exc:      # no thread could be started
+                    failed[store] = type(exc).__name__
+                    continue
+                futures[future] = (store, entry)
+                running.append(future)
+                room -= 1
+            if not running:
+                break
+            concurrent.futures.wait(running, timeout=left, return_when=concurrent.futures.FIRST_COMPLETED)
+        for future, (store, _) in futures.items():
+            if future.done():
                 try:
                     results[store] = list(future.result())
                 except Exception as exc:
                     failed[store] = type(exc).__name__
     finally:
-        for future in futures:
-            if future.cancel():
-                _release(key)
+        for future, (store, entry) in futures.items():
+            with _federation_lock:
+                if not entry["done"] and not entry["abandoned"]:
+                    entry["abandoned"] = True
+                    for charge in entry["charges"]:
+                        _federation_stuck[charge] = _federation_stuck.get(charge, 0) + 1
 
     skipped = [{"store": s, "reason": failed.get(s, "deadline")} for s in stores if s not in results]
 

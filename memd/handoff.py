@@ -70,13 +70,13 @@ def _same_proposer(row, proposer: str, account: str | None, credentials: tuple[s
 
 
 def replace_pending(conn, repo: str, proposer: str, keep_id: str, *, account: str | None = None,
-                    credential: str | None = None) -> int:
+                    credentials: tuple[str, ...] = ()) -> int:
     """Delete the same proposer's other pending handoffs for ``repo``; the number removed.
 
     They were never reviewed, and only the newest says where the work stands.
+    ``credentials`` is the proposing credential's lineage (memd.registry.lineage),
+    worked out before the caller's write transaction began.
     """
-    from memd.registry import lineage
-    credentials = lineage(credential)
     stale = []
     for row in conn.execute("SELECT id, meta, proposer, proposer_account, proposer_credential FROM candidates "
                             "WHERE status='pending' AND source=? AND id<>?", (SOURCE, keep_id)):

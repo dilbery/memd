@@ -805,15 +805,17 @@ def test_the_doctors_omp_read_back_is_skipped_only_where_the_probe_was_queued(mo
     monkeypatch.setattr(doctor, "mcp_call", lambda *a: (200, "No matching memory notes."))
     # A save that was to be written and cannot be found is a failure, as before.
     assert doctor.c12()[0] == "FAIL"
-    # The store queued the doctor's own probe, so it queued omp's save into it as well.
-    doctor.STATE["queued"] = "0123456789abcdef"
-    status, detail = doctor.c12()
-    assert status == "SKIP" and "waits for review" in detail
-    # A server that does not answer is not excused by that, and a nonce that is there still passes.
+    # A server that does not answer fails, and a nonce that is there passes.
     monkeypatch.setattr(doctor, "mcp_call", lambda *a: (503, "unavailable"))
     assert doctor.c12()[0] == "FAIL"
     monkeypatch.setattr(doctor, "mcp_call", lambda *a: (200, "Recalled memory: nonce omp-1790000000"))
     assert doctor.c12()[0] == "PASS"
+    # The store queued the doctor's own probe, so it queued omp's save into it as well. Its text is
+    # the same every run, so even a note that holds it (an earlier run's, approved) proves nothing.
+    doctor.STATE.update(queued="0123456789abcdef", nonce_b="omp-queued")
+    monkeypatch.setattr(doctor, "mcp_call", lambda *a: (200, "Recalled memory: nonce omp-queued"))
+    status, detail = doctor.c12()
+    assert status == "SKIP" and "waits for review" in detail
 
 
 def _queueing_store(store):
@@ -848,6 +850,29 @@ def test_the_doctor_sends_its_waiting_probe_again_instead_of_queueing_another(st
     assert details[0] == f"queued for review: candidate {waiting['id']} waits in the inbox, nothing was saved"
     assert details[1] == details[2] == (
         f"queued for review: candidate {waiting['id']} still waits in the inbox (sent again, nothing added)")
+
+
+def test_the_doctor_saves_a_fresh_nonce_once_the_store_stops_queueing(monkeypatch):
+    doctor = load_script("doctor_stopped_queueing", "maint/memd-doctor")
+    monkeypatch.setattr(doctor, "read_token", lambda _: "test-token")
+    monkeypatch.setattr(doctor, "time", SimpleNamespace(time=lambda: 1_790_000_500))
+    # An earlier run's probe still waits, but the store now saves the doctor's token directly.
+    old = doctor.PROBE_PREFIX + "doctor-1790000000"
+    saved = []
+
+    def call(name, arguments, token):
+        if name == "proposals" and arguments.get("id") is not None:
+            return 200, json.dumps({"ok": True, "proposal": {"id": "c1", "body": old}})
+        if name == "proposals":
+            return 200, json.dumps({"items": [{"id": "c1", "source": "save", "excerpt": old}]})
+        saved.append(arguments["content"])
+        return 200, json.dumps({"saved": True, "revision": "r", "lexical_indexed": True, "indexed": True,
+                                "synced": True, "action": "updated", "slug": doctor.PROBE_SLUG})
+    monkeypatch.setattr(doctor, "mcp_call", call)
+    status, detail = doctor.c5()
+    # The old text may be indexed already, so the round trip is proven with a fresh one.
+    assert status == "PASS" and saved == [old, doctor.PROBE_PREFIX + "doctor-1790000500"], (status, detail, saved)
+    assert doctor.STATE["nonce_a"] == "doctor-1790000500" and "queued" not in doctor.STATE
 
 
 def test_the_doctors_omp_probe_text_is_fixed_where_the_store_queues(monkeypatch):
