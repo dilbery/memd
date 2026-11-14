@@ -20,7 +20,7 @@ from fastapi.testclient import TestClient
 
 import memd.save as save_mod
 import memd.server as server_mod
-from memd import control, inbox, registry, share, user_memory
+from memd import actor, control, inbox, registry, share, user_memory
 from memd.hooks.handoff import handoff_fact
 from memd.identity import bind_identity, clear_identity
 from memd.normalize import normalize_fact
@@ -771,13 +771,8 @@ def test_the_doctor_fails_a_queued_probe_that_approval_would_save_beside_its_not
     doctor = load_script("doctor_queued_fork", "maint/memd-doctor")
     monkeypatch.setattr(doctor, "read_token", lambda _: "test-token")
     seconds = iter(range(1_790_000_000, 1_790_000_010))
-    monkeypatch.setattr(doctor, "time", SimpleNamespace(time=lambda: next(seconds)))    # a new nonce for each probe
-
-    def queued(name, arguments, token):
-        # What a store answers when its policy queues the doctor's token: the lint of the real save path.
-        proposed = inbox.propose(normalize_fact(arguments), "amber", cfg=store, source="save", proposer="doctor")
-        return 200, json.dumps(inbox.queued_receipt(proposed, "agents"))
-    monkeypatch.setattr(doctor, "mcp_call", queued)
+    monkeypatch.setattr(doctor, "time", SimpleNamespace(time=lambda: next(seconds)))
+    monkeypatch.setattr(doctor, "mcp_call", _queueing_store(store))
     status, detail = doctor.c5()
     assert status == "PASS" and detail.startswith("queued for review: "), detail
     # The probe note was retired, so a save under its slug adds a note beside it: the fork a direct save fails on.
@@ -786,7 +781,18 @@ def test_the_doctor_fails_a_queued_probe_that_approval_would_save_beside_its_not
                    "supersedes": doctor.PROBE_SLUG}, "amber", cfg=store)
     doctor.STATE.clear()
     status, detail = doctor.c5()
+    # The probe already waiting is sent again, and its receipt is the lint it was queued with
+    assert status == "PASS" and "still waits" in detail, detail
+    # Once a reviewer rejects it, the next probe is linted afresh
+    for c in list(inbox.pending_candidates(store, "amber")):
+        inbox.reject(store, "amber", c["id"], reviewer=inbox.operator_reviewer())
+    doctor.STATE.clear()
+    status, detail = doctor.c5()
     assert status == "FAIL" and doctor.PROBE_SLUG in detail and "queued" not in doctor.STATE, detail
+    # Rejected too, so the last probe is a fresh one.
+    for c in list(inbox.pending_candidates(store, "amber")):
+        inbox.reject(store, "amber", c["id"], reviewer=inbox.operator_reviewer())
+    doctor.STATE.clear()
     # So does one whose lint could not run at all.
     monkeypatch.setattr(inbox, "lint", lambda fact, profile, *, cfg: {"error": "lint unavailable: unreadable store"})
     status, detail = doctor.c5()
@@ -808,3 +814,56 @@ def test_the_doctors_omp_read_back_is_skipped_only_where_the_probe_was_queued(mo
     assert doctor.c12()[0] == "FAIL"
     monkeypatch.setattr(doctor, "mcp_call", lambda *a: (200, "Recalled memory: nonce omp-1790000000"))
     assert doctor.c12()[0] == "PASS"
+
+
+def _queueing_store(store):
+    who = actor.Caller("doctor")
+
+    def call(name, arguments, token):
+        if name == "proposals" and arguments.get("id") is not None:
+            proposal = inbox.own_proposal(store, "amber", who, arguments["id"])
+            return 200, json.dumps({"ok": True, "proposal": proposal})
+        if name == "proposals":
+            items = inbox.own_proposals(store, "amber", who, status=arguments.get("status", "pending"),
+                                        limit=arguments.get("limit", 20))
+            return 200, json.dumps(items)
+        proposed = inbox.propose(normalize_fact(arguments), "amber", cfg=store, source="save", proposer="doctor")
+        return 200, json.dumps(inbox.queued_receipt(proposed, "agents"))
+    return call
+
+
+def test_the_doctor_sends_its_waiting_probe_again_instead_of_queueing_another(store, monkeypatch):
+    doctor = load_script("doctor_waiting_probe", "maint/memd-doctor")
+    monkeypatch.setattr(doctor, "read_token", lambda _: "test-token")
+    seconds = iter(range(1_790_000_000, 1_790_000_010))
+    monkeypatch.setattr(doctor, "time", SimpleNamespace(time=lambda: next(seconds)))
+    monkeypatch.setattr(doctor, "mcp_call", _queueing_store(store))
+    details = []
+    for _ in range(3):
+        doctor.STATE.clear()
+        status, detail = doctor.c5()
+        assert status == "PASS"
+        details.append(detail)
+    [waiting] = list(inbox.pending_candidates(store, "amber"))
+    assert details[0] == f"queued for review: candidate {waiting['id']} waits in the inbox, nothing was saved"
+    assert details[1] == details[2] == (
+        f"queued for review: candidate {waiting['id']} still waits in the inbox (sent again, nothing added)")
+
+
+def test_the_doctors_omp_probe_text_is_fixed_where_the_store_queues(monkeypatch):
+    doctor = load_script("doctor_omp_fixed", "maint/memd-doctor")
+    prompts = []
+
+    def run(argv, **kw):
+        prompts.append(argv[2])
+        return SimpleNamespace(returncode=0, stdout="SAVED", stderr="")
+    monkeypatch.setattr(doctor.shutil, "which", lambda name: "/usr/bin/omp")
+    monkeypatch.setattr(doctor.subprocess, "run", run)
+    for queued in (None, "0123456789abcdef", "fedcba9876543210"):
+        doctor.STATE.clear()
+        if queued:
+            doctor.STATE["queued"] = queued
+        assert doctor.c11()[0] == "PASS"
+    assert "omp-queued" not in prompts[0]
+    assert "nonce omp-queued'" in prompts[1]
+    assert prompts[1] == prompts[2]

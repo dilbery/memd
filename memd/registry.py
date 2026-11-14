@@ -378,3 +378,38 @@ def enforce(operation, requested):
     if token_id is not None:
         return Registry().authorize(token_id, operation, requested)
     return requested
+
+
+LINEAGE_DEPTH = 32   # rotations followed back; a chain is never this long in practice
+
+
+def lineage(credential: str | None) -> tuple[str, ...]:
+    """The credential and the tokens it was rotated from, newest first; rotation keeps the caller the same proposer."""
+    if not credential:
+        return ()
+    if credential == "session" or credential.startswith("legacy:") or credential.startswith("identity:"):
+        return (credential,)
+    if not configured():
+        return (credential,)
+    try:
+        with Registry().connection(write=False) as db:
+            rows = db.execute(
+                """WITH RECURSIVE chain(id, parent, depth) AS (
+                       SELECT id, rotated_from, 0 FROM tokens WHERE id=?
+                       UNION ALL
+                       SELECT t.id, t.rotated_from, c.depth + 1 FROM tokens t JOIN chain c ON t.id = c.parent
+                       WHERE c.depth < ?)
+                   SELECT id FROM chain ORDER BY depth""",
+                (credential, LINEAGE_DEPTH)).fetchall()
+    except (sqlite3.Error, OSError, ControlError):
+        return (credential,)
+    seen = set()
+    result = []
+    for row in rows:
+        tid = row["id"]
+        if tid not in seen:
+            seen.add(tid)
+            result.append(tid)
+    if credential not in result:
+        result.insert(0, credential)
+    return tuple(result)

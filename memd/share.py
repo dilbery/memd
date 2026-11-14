@@ -48,6 +48,8 @@ import datetime
 import json
 import sqlite3
 import sys
+import threading
+import time
 from pathlib import Path
 
 TRAVELS = ("title", "body", "host", "tags", "importance", "description", "source",
@@ -55,9 +57,14 @@ TRAVELS = ("title", "body", "host", "tags", "importance", "description", "source
 NEVER_TRAVELS = ("saved_by", "pinned", "last_used", "superseded_by", "grounding", "profile",
                  "verification", "published_from")
 MAX_STORES = 16             # stores one federated recall may name or expand to
-FEDERATION_WORKERS = 4      # per-store recalls running at once
+FEDERATION_WORKERS = 16     # per-store recalls running at once in the process, abandoned ones included
+FEDERATION_PER_CALLER = 4   # of those, held at once by one caller's recalls; its other stores wait their turn
 FEDERATION_SLACK_MS = 1500  # beyond the embed + rerank deadlines, for SQLite and Git
 RRF_K = 60
+_federation_pool: concurrent.futures.ThreadPoolExecutor | None = None
+_federation_lock = threading.Lock()
+_federation_freed = threading.Condition(_federation_lock)   # notified when a caller's place is given back
+_federation_held: dict[tuple, int] = {}     # caller key -> threads its recalls hold or wait for
 
 
 # Set only by main(): the process is the local operator's CLI (see authorized_store).
@@ -487,6 +494,51 @@ def _as_dict(note) -> dict:
     return dict(to_dict()) if callable(to_dict) else dict(note)
 
 
+def _pool() -> concurrent.futures.ThreadPoolExecutor:
+    """The process-wide pool for federated recalls.
+
+    Created on first use, never at import, so a forked server process does not
+    inherit a pool without threads. Shared so that a recall that missed its
+    deadline keeps one of a fixed number of threads, bounding the total number
+    of running per-store recalls regardless of how many requests pile up.
+    """
+    global _federation_pool
+    if _federation_pool is None:
+        with _federation_lock:
+            if _federation_pool is None:
+                _federation_pool = concurrent.futures.ThreadPoolExecutor(
+                    max_workers=FEDERATION_WORKERS,
+                    thread_name_prefix="memd-federated",
+                )
+    return _federation_pool
+
+
+def _caller_key() -> tuple:
+    """Who the per-caller cap counts against.
+
+    An account across all its sessions and tokens, else the credential (a token
+    that is no one's account), else a local caller's label.
+    """
+    from memd.actor import caller
+    who = caller()
+    if who.account:
+        return ("account", who.account)
+    if who.credential:
+        return ("credential", who.credential)
+    return ("label", who.label)
+
+
+def _release(key: tuple) -> None:
+    """Give one of the caller's places back and wake the requests waiting for one."""
+    with _federation_freed:
+        remaining = _federation_held.get(key, 0) - 1
+        if remaining <= 0:
+            _federation_held.pop(key, None)
+        else:
+            _federation_held[key] = remaining
+        _federation_freed.notify_all()
+
+
 def federate(stores: list[str], recall_one, *, k: int, budget_ms: int | None = None
              ) -> tuple[list[dict], list[dict]]:
     """Run ``recall_one(store)`` per store in parallel; fuse and label the results.
@@ -496,27 +548,67 @@ def federate(stores: list[str], recall_one, *, k: int, budget_ms: int | None = N
     (1/(RRF_K + rank) within their own store, earlier store on a tie) and cut
     to `k`. A store that fails or misses the shared deadline is skipped and
     reported, never allowed to fail the others.
+
+    The stores run on the process's shared pool (`_pool`), at most
+    FEDERATION_PER_CALLER of one caller's at a time, the rest submitted as
+    places free; a recall abandoned at the deadline keeps its place until it ends.
     """
     budget = deadline_ms() if budget_ms is None else budget_ms
+    until = time.monotonic() + budget / 1000
+    key = _caller_key()
     results: dict[str, list] = {}
-    skipped: list[dict] = []
-    pool = concurrent.futures.ThreadPoolExecutor(max_workers=max(1, min(FEDERATION_WORKERS, len(stores))),
-                                                 thread_name_prefix="memd-federated")
+    failed: dict[str, str] = {}
+    waiting = list(stores)                 # not yet submitted, in order
+    futures: dict = {}                     # future -> store
+
+    def run(store):
+        try:
+            return recall_one(store)
+        finally:
+            _release(key)
+
     try:
-        # Each worker runs in a copy of the caller's context, so any code that
-        # consults the request's identity sees the same caller.
-        futures = {pool.submit(contextvars.copy_context().run, recall_one, store): store for store in stores}
-        done, _ = concurrent.futures.wait(futures, timeout=budget / 1000)
+        while True:
+            with _federation_lock:
+                room = max(0, FEDERATION_PER_CALLER - _federation_held.get(key, 0))
+                batch = waiting[:room]
+                if batch:
+                    _federation_held[key] = _federation_held.get(key, 0) + len(batch)
+            del waiting[:len(batch)]
+            for i, store in enumerate(batch):
+                try:
+                    # Each worker runs in a copy of the caller's context, so any code
+                    # that consults the request's identity sees the same caller.
+                    futures[_pool().submit(contextvars.copy_context().run, run, store)] = store
+                except BaseException:
+                    for _ in batch[i:]:
+                        _release(key)
+                    raise
+            running = [f for f in futures if not f.done()]
+            left = until - time.monotonic()
+            if left <= 0 or not (waiting or running):
+                break
+            if running:
+                concurrent.futures.wait(running, timeout=left,
+                                        return_when=concurrent.futures.FIRST_COMPLETED)
+            else:
+                # The caller's other requests hold its share: wait for a place.
+                with _federation_freed:
+                    if _federation_held.get(key, 0) >= FEDERATION_PER_CALLER:
+                        _federation_freed.wait(timeout=left)
         for future, store in futures.items():
-            if future not in done:
-                skipped.append({"store": store, "reason": "deadline"})
-                continue
-            try:
-                results[store] = list(future.result())
-            except Exception as exc:
-                skipped.append({"store": store, "reason": type(exc).__name__})
+            if future.done() and not future.cancelled():
+                try:
+                    results[store] = list(future.result())
+                except Exception as exc:
+                    failed[store] = type(exc).__name__
     finally:
-        pool.shutdown(wait=False, cancel_futures=True)
+        for future in futures:
+            if future.cancel():
+                _release(key)
+
+    skipped = [{"store": s, "reason": failed.get(s, "deadline")} for s in stores if s not in results]
+
     core: list[dict] = []
     ranked: list[tuple[float, int, int, dict]] = []
     for order, store in enumerate(stores):

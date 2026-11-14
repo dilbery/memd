@@ -314,9 +314,11 @@ def _own_proposal(row: sqlite3.Row, reviewer: Reviewer) -> bool:
 
     Labels are not unique, so ids decide. A candidate without them was filed by
     a local caller or before ids were recorded: the label is all there is.
+    Rotation keeps a token the proposer of its predecessors' candidates.
     """
+    from memd.registry import lineage
     if row["proposer_credential"]:
-        return row["proposer_credential"] == reviewer.credential
+        return row["proposer_credential"] in lineage(reviewer.credential)
     return row["proposer"] == reviewer.label
 
 
@@ -482,10 +484,6 @@ def propose(payload: dict, profile: str, *, cfg, source: str = "agent", proposer
     account, credential = (caller.account, caller.credential) if caller is not None else (None, None)
     own = _proposer_key(proposer, account, credential)
     path = inbox_path(cfg, profile)
-    # A handoff replaces its proposer's older pending one rather than repeating
-    # it, so handoffs are not compared with each other.
-    restated = _restated(title, body, (c for c in pending_candidates(cfg, profile)
-                                        if handoff_repo is None or c["source"] != handoff.SOURCE))
     conn = _connect(path)
     try:
         # Provenance is part of identity: a publish must not fold into an ordinary
@@ -499,11 +497,16 @@ def propose(payload: dict, profile: str, *, cfg, source: str = "agent", proposer
                 raise ValueError(f"The inbox already holds {MAX_PENDING} pending candidates; review some first")
     finally:
         conn.close()
+    # Every pending text is read, so only after the cheap checks above: a full
+    # inbox has refused by now. A handoff replaces its proposer's older pending
+    # one rather than repeating it, so handoffs are not compared with each other.
+    restated = _restated(title, body, (c for c in pending_candidates(cfg, profile)
+                                        if handoff_repo is None or c["source"] != handoff.SOURCE))
     if existing is not None:
         # The stored lint was written for reviewers and for the candidate's own
         # proposer: it shows the slug and the superseded note that proposer
         # asked for. Anyone else is told what its own fact would do.
-        if all(existing[column] == value for column, value in own.items()):
+        if _is_own(existing, own):
             report = json.loads(existing["lint"] or "{}")
         else:
             report = precomputed_lint if precomputed_lint is not None else lint(fact, profile, cfg=cfg)
@@ -540,18 +543,36 @@ def _proposer_key(label: str, account: str | None, credential: str | None) -> di
     Narrower than ``_own_proposal``. Every session of an account carries the
     same credential, so the account and the credential must both match. A
     caller without ids is a local one, known by its label, and so are its
-    candidates: one that has ids is never matched by a label.
+    candidates: one that has ids is never matched by a label. A rotated
+    registry token keeps its predecessors' candidates (memd.registry.lineage),
+    so the credential column's value is a tuple.
     """
+    from memd.registry import lineage
     if account is None and credential is None:
         return {"proposer_account": None, "proposer_credential": None, "proposer": (label or "")[:200]}
-    return {"proposer_account": account, "proposer_credential": credential}
+    return {"proposer_account": account, "proposer_credential": lineage(credential) or None}
 
 
 def _restated(title: str, body: str, waiting) -> list[dict]:
     """The pending candidates that say much the same as this text (distill's check), without their text."""
-    text = title + "\n" + body
+    mine = _tokens(title + "\n" + body)       # once, not once per candidate
     return [{k: v for k, v in c.items() if k != "body"} for c in waiting
-            if _similar(text, c["title"] + "\n" + c["body"])]
+            if _similar_tokens(mine, _tokens(c["title"] + "\n" + c["body"]))]
+
+
+def _is_own(row, own: dict) -> bool:
+    """Whether a candidate row (or dict) has the column values of ``_proposer_key``.
+
+    A tuple value is the credential and its predecessors: any of them matches.
+    """
+    for column, value in own.items():
+        if isinstance(value, tuple):
+            if row[column] not in value:
+                return False
+        else:
+            if row[column] != value:
+                return False
+    return True
 
 
 def _proposer_lint(report: dict, restated: list[dict], own: dict) -> dict:
@@ -562,8 +583,7 @@ def _proposer_lint(report: dict, restated: list[dict], own: dict) -> dict:
     even how many: a count would let a proposer test guesses about what others
     have waiting.
     """
-    mine = [{"id": c["id"], "title": c["title"]} for c in restated
-            if all(c[column] == value for column, value in own.items())]
+    mine = [{"id": c["id"], "title": c["title"]} for c in restated if _is_own(c, own)]
     return {**report, "pending_duplicates": mine}
 
 
@@ -605,7 +625,16 @@ def _proposal(row: sqlite3.Row, *, full: bool = False) -> dict:
 
 def _own_where(caller) -> tuple[str, tuple]:
     own = _proposer_key(caller.label, caller.account, caller.credential)
-    return " AND ".join(f"{column} IS ?" for column in own), tuple(own.values())
+    conditions = []
+    args = []
+    for column, value in own.items():
+        if isinstance(value, tuple):
+            conditions.append(f"{column} IN ({','.join('?' * len(value))})")
+            args.extend(value)
+        else:
+            conditions.append(f"{column} IS ?")
+            args.append(value)
+    return " AND ".join(conditions), tuple(args)
 
 
 def own_proposals(cfg, profile: str, caller, *, status: str = "pending", limit: int = 50,
@@ -1147,7 +1176,10 @@ def _tokens(text: str) -> set[str]:
 
 
 def _similar(a: str, b: str) -> bool:
-    ta, tb = _tokens(a), _tokens(b)
+    return _similar_tokens(_tokens(a), _tokens(b))
+
+
+def _similar_tokens(ta: set[str], tb: set[str]) -> bool:
     if not ta or not tb:
         return False
     return len(ta & tb) / len(ta | tb) >= 0.7

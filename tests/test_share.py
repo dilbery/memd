@@ -6,6 +6,7 @@ socket guard blocks everything else. Every refusal also asserts that nothing
 was written and nothing from the refused store came back.
 """
 import asyncio
+import contextvars
 import json
 import subprocess
 import threading
@@ -17,7 +18,7 @@ from fastapi.testclient import TestClient
 import memd.mcp as mcp_mod
 import memd.recall as recall_mod
 import memd.save as save_mod
-from memd import control, facts, server, share, sources
+from memd import actor, control, facts, server, share, sources
 from memd.config import Config
 from memd.refresh import ensure_lexical
 from memd.store import list_notes, read_note
@@ -623,6 +624,9 @@ def test_federated_deadline_ms_can_only_shorten_the_server_budget(team, monkeypa
 def test_federated_small_deadline_ms_skips_a_slow_store_and_names_it(team, monkeypatch):
     agent = _agent(team, {"team": "write"})
     monkeypatch.setenv("MEMD_FEDERATED_DEADLINE_MS", "20000")
+    # One caller asks again and again while its hung recalls hold their places; past its
+    # share even the fast store would wait (test_one_caller_holds_at_most_its_share_...).
+    monkeypatch.setattr(share, "FEDERATION_PER_CALLER", 64)
     release = _hold(monkeypatch)
     line = "[Stores not searched: team (deadline).]"
     body = {"query": "archive backup", "stores": ["amber", "team"], "deadline_ms": 300}
@@ -836,3 +840,74 @@ def test_federated_facts_block_is_never_read_from_an_ungranted_store(team):
         text, stores, _, _ = _federated(agent, surface, {"query": PROXY_NOW, "scope": "all"})
         assert stores == ["amber", "team"] and "vaulthost" not in text
         assert text.endswith("\n\n" + _proxy_fact("amber", "gpuhost"))
+
+
+def test_recalls_abandoned_at_a_deadline_hold_threads_of_one_bounded_pool(monkeypatch):
+    monkeypatch.setattr(share, "FEDERATION_WORKERS", 2)
+    monkeypatch.setattr(share, "FEDERATION_PER_CALLER", 10)    # the pool is the limit here, not the caller
+    monkeypatch.setattr(share, "_federation_pool", None)
+    monkeypatch.setattr(share, "_federation_held", {})
+    release = threading.Event()
+    started = []
+
+    def one(store):
+        if store.startswith("slow"):
+            started.append(store)
+            release.wait(10)
+            return []
+        return [{"slug": f"{store}-0", "matched": True, "body": "b"}]
+    try:
+        for n in range(3):
+            notes, skipped = share.federate([f"slow{n}a", f"slow{n}b", "fast"], one, k=4, budget_ms=150)
+            assert notes == []
+            assert {s["store"]: s["reason"] for s in skipped} == {
+                f"slow{n}a": "deadline", f"slow{n}b": "deadline", "fast": "deadline"}
+        # The first call's two abandoned recalls hold both threads; nothing later starts
+        assert sorted(started) == ["slow0a", "slow0b"]
+        assert len(share._federation_pool._threads) == 2
+    finally:
+        release.set()
+        if share._federation_pool is not None:
+            share._federation_pool.shutdown(wait=True)
+
+
+def test_one_caller_holds_at_most_its_share_of_the_federation_pool(monkeypatch):
+    monkeypatch.setattr(share, "FEDERATION_WORKERS", 8)
+    monkeypatch.setattr(share, "FEDERATION_PER_CALLER", 2)
+    monkeypatch.setattr(share, "_federation_pool", None)
+    monkeypatch.setattr(share, "_federation_held", {})
+    release = threading.Event()
+    ran = []
+
+    def one(store):
+        ran.append(store)
+        if store.startswith("slow"):
+            release.wait(10)
+            return []
+        return [{"slug": f"{store}-0", "matched": True, "body": "b"}]
+
+    def as_caller(label, stores, budget_ms=150):
+        def run_federate():
+            actor.set_actor(label)
+            return share.federate(stores, one, k=8, budget_ms=budget_ms)
+        return contextvars.copy_context().run(run_federate)
+    # A request naming more stores than its share runs them all, a share at a time.
+    notes, skipped = as_caller("many", [f"fast-{n}" for n in range(5)], budget_ms=3000)
+    assert skipped == [] and sorted(n["slug"] for n in notes) == [f"fast-{n}-0" for n in range(5)]
+    try:
+        notes, skipped = as_caller("looper", ["slow-a", "slow-b", "fast-a"])
+        # Its third store waits for a place its own hung recalls never give back.
+        assert skipped == [{"store": s, "reason": "deadline"} for s in ("slow-a", "slow-b", "fast-a")]
+        # Its two abandoned recalls still hold its share, so the next request starts nothing.
+        notes, skipped = as_caller("looper", ["fast-b"])
+        assert skipped == [{"store": "fast-b", "reason": "deadline"}] and notes == []
+        assert "fast-a" not in ran and "fast-b" not in ran
+        # Another caller is served.
+        notes, skipped = as_caller("someone-else", ["fast-c"])
+        assert skipped == [] and [n["slug"] for n in notes] == ["fast-c-0"]
+    finally:
+        release.set()
+        if share._federation_pool is not None:
+            share._federation_pool.shutdown(wait=True)
+    # Every place was given back.
+    assert share._federation_held == {}

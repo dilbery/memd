@@ -694,3 +694,45 @@ def test_the_proposals_tool_is_advertised_beside_propose_and_is_read_only():
     assert schema["required"] == []
     assert schema["properties"]["status"]["enum"] == ["pending", "approved", "rejected", "all"]
     assert {"items", "proposal", "counts", "total"} <= set(tool.output_schema["properties"])
+
+
+def test_a_rotated_registry_token_keeps_its_proposals_and_still_cannot_approve_them(store, tmp_path, monkeypatch):
+    monkeypatch.setenv("MEMD_CONTROL_DB", str(tmp_path / "control" / "control.db"))
+    tokens = registry.Registry()
+    tokens.initialize()
+
+    def issue():
+        return tokens.issue(actor="operator", operation_id=str(uuid.uuid4()), label="shared",
+                            owner="team", purpose="agents", stores=["amber"], operations=["read", "save"])
+    made, other = issue(), issue()
+    bearer = lambda secret: {"Authorization": "Bearer " + secret}
+    with TestClient(server_mod.create_token_app()) as client:
+        mine = _propose(client, FIRST, bearer(made["secret"]))
+        rotated = tokens.rotate(made["token"]["id"], actor="operator", operation_id=str(uuid.uuid4()),
+                               revision=made["token"]["revision"], overlap_hours=0)
+        successor = bearer(rotated["secret"])
+        assert _mine(client, successor) == {mine["id"]}
+        assert client.get(f"/proposals/{mine['id']}", headers=successor).json()["body"] == BODY
+        again = _propose(client, FIRST, successor)
+        assert again["duplicate"] is True and again["id"] == mine["id"]
+        assert _mine(client, bearer(other["secret"])) == set()
+        assert client.get(f"/proposals/{mine['id']}", headers=bearer(other["secret"])).status_code == 404
+    assert registry.lineage(rotated["token"]["id"]) == (rotated["token"]["id"], made["token"]["id"])
+    row = {"proposer_credential": made["token"]["id"], "proposer": "shared"}
+    for credential, expected in ((rotated["token"]["id"], True), (made["token"]["id"], True),
+                                 (other["token"]["id"], False)):
+        reviewer = inbox._reviewer("shared", credential=credential, is_token=True, store="amber")
+        assert inbox._own_proposal(row, reviewer) is expected
+
+
+def test_a_full_inbox_refuses_before_reading_the_pending_texts(store, monkeypatch):
+    monkeypatch.setattr(inbox, "MAX_PENDING", 2)
+    inbox.propose(dict(FIRST), "amber", cfg=store, proposer="mem-import", precomputed_lint={})
+    inbox.propose(dict(UNRELATED), "amber", cfg=store, proposer="mem-import", precomputed_lint={})
+
+    def refuse_read(*args, **kwargs):
+        raise AssertionError("read the pending texts")
+    monkeypatch.setattr(inbox, "pending_candidates", refuse_read)
+    with pytest.raises(ValueError, match="already holds 2 pending"):
+        inbox.propose({"title": "Gate code", "body": "The side gate code changes every quarter."},
+                      "amber", cfg=store, proposer="mem-import", precomputed_lint={})

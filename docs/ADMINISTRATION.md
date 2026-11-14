@@ -289,8 +289,10 @@ who changes it; it makes the second visible in the audit log.
 the two it saw. A queued probe that an approval would save beside the probe
 note, not over it, still fails, as a direct save that forks does. Against a
 store that queues its token the probes are never written, so both read-back
-checks (the probe's and the omp probe's) are skipped, and each run leaves its
-probe candidates pending for a reviewer to reject.
+checks (the probe's and the omp probe's) are skipped. The doctor then sends the
+text of its probe that is already waiting (and omp a fixed one), which the inbox
+folds into the waiting candidate: the store holds at most one of each until a
+reviewer rejects them, not one more every run.
 
 ## Encrypted stores
 

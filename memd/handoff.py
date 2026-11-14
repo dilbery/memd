@@ -55,16 +55,17 @@ def repo_key(fact: dict) -> str | None:
     return repos[0]
 
 
-def _same_proposer(row, proposer: str, account: str | None, credential: str | None) -> bool:
+def _same_proposer(row, proposer: str, account: str | None, credentials: tuple[str, ...]) -> bool:
     """Whether the caller with this label and these ids filed the candidate.
 
     Ids decide when the candidate has them: the credential, together with the
     account because every browser session carries the same credential. One
     without ids was filed by a local caller or before ids were recorded, and is
-    matched by label.
+    matched by label. ``credentials`` is the caller's credential and the ones
+    it was rotated from (memd.registry.lineage).
     """
     if row["proposer_credential"]:
-        return (row["proposer_credential"], row["proposer_account"]) == (credential, account)
+        return row["proposer_account"] == account and row["proposer_credential"] in credentials
     return row["proposer"] == proposer
 
 
@@ -74,10 +75,12 @@ def replace_pending(conn, repo: str, proposer: str, keep_id: str, *, account: st
 
     They were never reviewed, and only the newest says where the work stands.
     """
+    from memd.registry import lineage
+    credentials = lineage(credential)
     stale = []
     for row in conn.execute("SELECT id, meta, proposer, proposer_account, proposer_credential FROM candidates "
                             "WHERE status='pending' AND source=? AND id<>?", (SOURCE, keep_id)):
-        if not _same_proposer(row, proposer, account, credential):
+        if not _same_proposer(row, proposer, account, credentials):
             continue
         try:
             meta = json.loads(row["meta"] or "{}")
@@ -111,6 +114,7 @@ def latest(cfg, profile: str, repo: str, *, proposer: str, account: str | None =
     from memd import inbox
     from memd.profiles import guard_paths
     from memd.store import read_note
+    from memd.registry import lineage
     if not valid_repo(repo):
         raise ValueError("repo must be a repository key such as example.com/team/project")
     now = time.time() if now is None else now
@@ -125,6 +129,7 @@ def latest(cfg, profile: str, repo: str, *, proposer: str, account: str | None =
             "ORDER BY created DESC, id LIMIT ?", (SOURCE, cutoff, _SCAN_LIMIT)).fetchall()
     finally:
         conn.close()
+    credentials = lineage(credential)
     clone = None
     for row in rows:
         try:
@@ -134,7 +139,7 @@ def latest(cfg, profile: str, repo: str, *, proposer: str, account: str | None =
         if repo_key(meta) != repo:
             continue
         if row["status"] == "pending":
-            if not _same_proposer(row, proposer, account, credential):
+            if not _same_proposer(row, proposer, account, credentials):
                 continue
             text = row["body"]
         else:

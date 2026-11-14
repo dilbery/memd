@@ -16,6 +16,7 @@ import os
 import subprocess
 import sys
 import time
+import uuid
 from pathlib import Path
 
 import httpx
@@ -27,7 +28,7 @@ import memd.hooks.handoff as pkg
 import memd.save as save_mod
 import memd.server as server_mod
 import memd.recall as recall_mod
-from memd import actor, control, handoff, inbox, sources
+from memd import actor, control, handoff, inbox, registry, sources
 from memd.config import Config
 from memd.store import list_notes
 
@@ -868,3 +869,27 @@ def test_git_state_skips_status_when_repository_defines_filters(hook, tmp_path):
 
 def test_repo_defines_filters_is_false_for_a_plain_repository(hook, tmp_path):
     assert hook.repo_defines_filters(str(_repo(tmp_path))) is False
+
+
+def test_a_rotated_registry_token_keeps_and_replaces_its_pending_handoff(store, tmp_path, monkeypatch):
+    monkeypatch.setenv("MEMD_CONTROL_DB", str(tmp_path / "control" / "control.db"))
+    tokens = registry.Registry()
+    tokens.initialize()
+
+    def issue(label="laptop"):
+        return tokens.issue(actor="operator", operation_id=str(uuid.uuid4()), label=label, owner="team",
+                            purpose="agents", stores=["amber"], operations=["read", "save"])
+    made = issue()
+    old = made["token"]["id"]
+    new = tokens.rotate(old, actor="operator", operation_id=str(uuid.uuid4()),
+                        revision=made["token"]["revision"], overlap_hours=0)["token"]["id"]
+    other = issue()["token"]["id"]
+    key = "git.example.com/team/widget"
+    inbox.propose(_fact(body="Filed before the rotation."), "amber", cfg=store, proposer="laptop",
+                  caller=actor.Caller("laptop", None, old))
+    found = handoff.latest(store, "amber", key, proposer="laptop", credential=new)
+    assert found["status"] == "pending" and found["text"] == "Filed before the rotation."
+    assert handoff.latest(store, "amber", key, proposer="laptop", credential=other) is None
+    second = inbox.propose(_fact(body="Filed after the rotation."), "amber", cfg=store, proposer="laptop",
+                           caller=actor.Caller("laptop", None, new))["id"]
+    assert [c["id"] for c in inbox.pending_candidates(store, "amber")] == [second]

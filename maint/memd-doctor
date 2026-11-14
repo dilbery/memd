@@ -31,6 +31,7 @@ TOKEN_ENV_FILE = os.path.join(ENV_DIR, "memd-claude.env")
 # and C5/C11 fail if a save lands anywhere else.
 PROBE_SLUG = "memd-doctor-probe"
 OMP_PROBE_SLUG = "memd-doctor-probe-omp"
+PROBE_PREFIX = "memd daily probe. nonce "   # C5's probe text; its nonce follows
 HTTP_TIMEOUT = 20.0
 OMP_TIMEOUT = 360
 
@@ -252,16 +253,58 @@ def c4() -> tuple[str, str]:
     return ("PASS", f"{len(text)} chars")
 
 
+def waiting_probe(token: str) -> dict | None:
+    """The doctor's own probe that already waits for review, with its full text, or None.
+
+    Saving that text again folds into it instead of queueing another.
+    """
+    status, text = mcp_call("proposals", {"status": "pending", "limit": 50}, token)
+    if status != 200:
+        return None
+    try:
+        data = json.loads(text)
+    except (json.JSONDecodeError, ValueError):
+        return None
+    if not isinstance(data, dict) or not isinstance(data.get("items"), list):
+        return None
+
+    for item in data["items"]:
+        if not isinstance(item, dict):
+            continue
+        excerpt = item.get("excerpt")
+        if item.get("source") == "save" and isinstance(excerpt, str) and excerpt.startswith(PROBE_PREFIX + "doctor-"):
+            status2, text2 = mcp_call("proposals", {"id": item["id"]}, token)
+            if status2 != 200:
+                continue
+            try:
+                parsed = json.loads(text2)
+            except (json.JSONDecodeError, ValueError):
+                continue
+            if isinstance(parsed, dict):
+                proposal = parsed.get("proposal")
+                if isinstance(proposal, dict) and isinstance(proposal.get("body"), str):
+                    return proposal
+    return None
+
+
 def c5() -> tuple[str, str]:
     """C5 — save via alias shape."""
     token = read_token(TOKEN_ENV_FILE)
     if not token:
         return ("FAIL", "no memd token")
 
-    nonce_a = f"doctor-{int(time.time())}"
+    waiting = waiting_probe(token)
+
+    if waiting is not None:
+        content = waiting["body"]
+        nonce_a = content.rsplit("nonce ", 1)[-1].strip()
+    else:
+        nonce_a = f"doctor-{int(time.time())}"
+        content = f"{PROBE_PREFIX}{nonce_a}"
+
     payload_args = {
         "slug": PROBE_SLUG,
-        "content": f"memd daily probe. nonce {nonce_a}",
+        "content": content,
         "importance": 1,
         "tags": "probe"
     }
@@ -290,7 +333,11 @@ def c5() -> tuple[str, str]:
             return ("FAIL", f"queued probe {inbox_id} would not update {PROBE_SLUG!r} when approved "
                     f"(slug {parsed.get('slug')!r}): {str(parsed.get('warnings'))[:300]}")
         STATE['queued'] = inbox_id
-        return ("PASS", f"queued for review: candidate {inbox_id} waits in the inbox, nothing was saved")
+        if waiting is not None and inbox_id == waiting.get("id"):
+            detail = f"queued for review: candidate {inbox_id} still waits in the inbox (sent again, nothing added)"
+        else:
+            detail = f"queued for review: candidate {inbox_id} waits in the inbox, nothing was saved"
+        return ("PASS", detail)
 
     if ("error" in parsed or parsed.get("saved") is not True
             or not parsed.get("revision") or parsed.get("lexical_indexed") is not True):
@@ -397,7 +444,9 @@ def c10():
 def c11():
     if shutil.which("omp") is None:
         return ("SKIP", "omp not installed")
-    nonce_b = f"omp-{int(time.time())}"
+    # A store that queued C5's probe queues omp's too; a fixed text folds into
+    # the one already waiting instead of adding another each run.
+    nonce_b = "omp-queued" if STATE.get("queued") else f"omp-{int(time.time())}"
     prompt = (
         f"Using your memd save tool mounted at xd://mcp__memd_save, save a note with slug '{OMP_PROBE_SLUG}', "
         f"body 'memd daily probe via omp. nonce {nonce_b}', importance 1, tags ['probe']. Then reply with just: SAVED"
